@@ -31,15 +31,19 @@
  * The fragment shader reads the buffers it blends into as input
  * attachments that are also its colour attachments (a feedback loop, all
  * images in VK_IMAGE_LAYOUT_GENERAL).  Draws are ordered by a by-region
- * self-dependency barrier between them (MoltenVK included).  Without
- * VK_EXT_rasterization_order_attachment_access, overlapping primitives
- * of one draw are not ordered on other GPUs (not handled yet).
+ * self-dependency barrier between them (MoltenVK included).  That leaves
+ * overlapping primitives of one draw unordered on GPUs other than Apple's,
+ * so where VK_EXT_fragment_shader_interlock is available the buffers are
+ * storage images instead, read and written only inside an ordered pixel
+ * interlock (R300_GLSL_FB_INTERLOCK), which orders every overlapping
+ * fragment of the subpass, across draws too.
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  */
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/error-report.h"
 #include "qemu/thread.h"
 #include "qemu/atomic.h"
 #include "qemu/bitmap.h"
@@ -63,6 +67,7 @@
 #define VK_MAX_DR           8       /* dirty rectangles per image */
 
 static char vk_err[256];
+static PPCMacGPURenderer vulkan_renderer;
 
 static void vk_fail(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
 static void vk_fail(const char *fmt, ...)
@@ -169,6 +174,7 @@ typedef struct VkPipeKey {
     VkPrimitiveTopology topo;
     VkCullModeFlags cull;
     VkFrontFace front;
+    uint32_t vs_id;             /* GPU vertex program (pkt->vs_id), 0: the pass-through */
 } VkPipeKey;
 typedef struct VkProg {
     VkShaderModule mod[3];      /* R300Stage */
@@ -232,6 +238,8 @@ static struct {
     VkImg *pass_img[VK_MAX_ATT];
     bool pass_z;                /* last attachment is the depth buffer */
     bool pass_z16;
+    bool interlock;             /* R300_GLSL_FB_INTERLOCK: the attachments are
+                                   storage images, the pass has none */
 
     VkImg img[VK_MAX_IMG];
     VkTexFull texfull[VK_MAX_TEXFULL];
@@ -241,6 +249,9 @@ static struct {
     VkFB fbs[VK_MAX_FB];
     unsigned fb_next;
     GHashTable *progs;          /* GLSL -> VkProg */
+    GHashTable *vs_mods;        /* vs_id -> VkShaderModule (GPU vertex programs) */
+    /* glsl_id -> VkProg, direct-mapped, so a draw needn't hash its source */
+    struct { uint32_t id; struct VkProg *pg; } prog_slot[256];
     GHashTable *samplers;       /* key -> VkSampler */
     VkImage dummy_img[3];
     VkDeviceMemory dummy_mem[3];
@@ -254,6 +265,7 @@ static struct {
     GQueue *waitq;              /* VkWaitItem */
     bool thread_started;
 
+    bool lost;                  /* a fence wait failed: the device is gone */
     uint64_t stat_draws, stat_passes, stat_uploads, stat_writebacks, stat_flushes;
 } V;
 
@@ -302,7 +314,7 @@ static bool vk_ctx_init(void)
     VkExtensionProperties *ie = NULL, *de = NULL;
     VkPhysicalDevice *pd = NULL;
     uint32_t n = 0;
-    const char *iext[4], *dext[4];
+    const char *iext[4], *dext[6];
     uint32_t niext = 0, ndext = 0;
     bool portability = false;
 
@@ -396,6 +408,8 @@ static bool vk_ctx_init(void)
     if (mirror_ext) {
         dext[ndext++] = VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME;
     }
+    bool il_ext = vk_has_ext(de, n, VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME) &&
+                  vk_has_ext(de, n, VK_EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_EXTENSION_NAME);
     g_free(de);
     de = NULL;
 
@@ -415,9 +429,17 @@ static bool vk_ctx_init(void)
     VkPhysicalDeviceVulkan12Features f12 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
     };
+    VkPhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT fdem = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES_EXT,
+        .pNext = V.props.apiVersion >= VK_API_VERSION_1_2 ? &f12 : NULL,
+    };
+    VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT fil = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT,
+        .pNext = &fdem,
+    };
     VkPhysicalDeviceFeatures2 f2 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-        .pNext = V.props.apiVersion >= VK_API_VERSION_1_2 ? &f12 : NULL,
+        .pNext = il_ext ? (void *)&fil : fdem.pNext,
     };
     vkGetPhysicalDeviceFeatures2(V.pdev, &f2);
     if (!f2.features.fragmentStoresAndAtomics) {
@@ -439,6 +461,47 @@ static bool vk_ctx_init(void)
         .samplerMirrorClampToEdge = f12.samplerMirrorClampToEdge,
     };
     V.mirror_clamp = mirror_ext || f12.samplerMirrorClampToEdge;
+
+    /*
+     * Order the framebuffer reads and writes of overlapping primitives in
+     * one draw (see the top of the file) with an ordered pixel interlock
+     * over storage images.  Not on MoltenVK: Apple GPUs order the
+     * framebuffer fetch already.  PPCGPU_VK_INTERLOCK=0 turns it off.
+     */
+    {
+        const char *e = getenv("PPCGPU_VK_INTERLOCK");
+        V.interlock = il_ext && !V.moltenvk && fil.fragmentShaderPixelInterlock &&
+                      fdem.shaderDemoteToHelperInvocation &&
+                      f2.features.shaderStorageImageExtendedFormats &&
+                      !(e && *e == '0');
+        /* every colour buffer format, and Z (R16/R32 uint), as a storage image */
+        static const VkFormat sf[] = {
+            VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8_UINT, VK_FORMAT_R16_UINT,
+            VK_FORMAT_R32_UINT, VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32B32A32_UINT,
+        };
+        for (unsigned i = 0; V.interlock && i < ARRAY_SIZE(sf); i++) {
+            VkFormatProperties fp;
+            vkGetPhysicalDeviceFormatProperties(V.pdev, sf[i], &fp);
+            V.interlock = fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+        }
+        /* r8ui, r16ui and rg32ui need the extended storage formats */
+        want.shaderStorageImageExtendedFormats = V.interlock;
+    }
+    VkPhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT wdem = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES_EXT,
+        .pNext = V.props.apiVersion >= VK_API_VERSION_1_2 ? &w12 : NULL,
+        .shaderDemoteToHelperInvocation = VK_TRUE,
+    };
+    VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT wil = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT,
+        .pNext = &wdem,
+        .fragmentShaderPixelInterlock = VK_TRUE,
+    };
+    if (V.interlock) {
+        dext[ndext++] = VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME;
+        dext[ndext++] = VK_EXT_SHADER_DEMOTE_TO_HELPER_INVOCATION_EXTENSION_NAME;
+        vulkan_renderer.r300_glsl_flags |= R300_GLSL_FB_INTERLOCK;
+    }
 
     n = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(V.pdev, &n, NULL);
@@ -465,7 +528,7 @@ static bool vk_ctx_init(void)
     };
     VkDeviceCreateInfo dci = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext = V.props.apiVersion >= VK_API_VERSION_1_2 ? &w12 : NULL,
+        .pNext = V.interlock ? (void *)&wil : wdem.pNext,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &qci,
         .enabledExtensionCount = ndext,
@@ -486,7 +549,7 @@ static bool vk_ctx_init(void)
     VKCHECK(vkCreateCommandPool(V.dev, &cpi, NULL, &V.cmdpool), "vkCreateCommandPool");
 
     /* One descriptor set layout for every R300 program (R300_BIND_*). */
-    VkDescriptorSetLayoutBinding b[6 + VK_MAX_ATT + R300_NUM_TEX_UNITS];
+    VkDescriptorSetLayoutBinding b[7 + VK_MAX_ATT + R300_NUM_TEX_UNITS];
     uint32_t nb = 0;
     const VkShaderStageFlags all = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     b[nb++] = (VkDescriptorSetLayoutBinding){ R300_BIND_UNIFORMS,
@@ -501,9 +564,12 @@ static bool vk_ctx_init(void)
         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, all, NULL };
     b[nb++] = (VkDescriptorSetLayoutBinding){ R300_BIND_AUX,
         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, all, NULL };
+    b[nb++] = (VkDescriptorSetLayoutBinding){ R300_BIND_VSU,
+        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, NULL };
     for (uint32_t k = 0; k < VK_MAX_ATT; k++) {
         b[nb++] = (VkDescriptorSetLayoutBinding){ R300_BIND_FB0 + k,
-            VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+            V.interlock ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+            1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
     }
     for (uint32_t k = 0; k < R300_NUM_TEX_UNITS; k++) {
         b[nb++] = (VkDescriptorSetLayoutBinding){ R300_BIND_TEX0 + k,
@@ -539,6 +605,7 @@ static bool vk_ctx_init(void)
     }
     V.free_chunks = g_ptr_array_new();
     V.progs = g_hash_table_new(g_str_hash, g_str_equal);
+    V.vs_mods = g_hash_table_new(g_direct_hash, g_direct_equal);
     V.samplers = g_hash_table_new(g_direct_hash, g_direct_equal);
 
     qemu_mutex_init(&V.lock);
@@ -548,11 +615,12 @@ static bool vk_ctx_init(void)
     qemu_thread_create(&V.thread, "vk-wait", vk_waiter, NULL, QEMU_THREAD_DETACHED);
     V.thread_started = true;
 
-    qemu_log("ppc-mac-gpu vulkan: %s (%s, Vulkan %u.%u)%s\n", V.props.deviceName,
+    qemu_log("ppc-mac-gpu vulkan: %s (%s, Vulkan %u.%u)%s%s\n", V.props.deviceName,
              V.moltenvk ? "MoltenVK" : "native",
              VK_API_VERSION_MAJOR(V.props.apiVersion),
              VK_API_VERSION_MINOR(V.props.apiVersion),
-             V.bc ? "" : ", no BC (DXT) textures");
+             V.bc ? "" : ", no BC (DXT) textures",
+             V.interlock ? ", ordered pixel interlock" : "");
     V.ready = true;
     return true;
 
@@ -741,6 +809,22 @@ static void vk_set_done(uint32_t seq)
     }
 }
 
+/*
+ * Wait for a batch's fence.  A failure (VK_ERROR_DEVICE_LOST: a GPU reset,
+ * a driver crash) means nothing more will render; say so once, loudly.
+ * Completion is still reported to the guest: holding it back would hang
+ * Mac OS X on the fence for good, which is worse than a frozen picture.
+ */
+static void vk_wait_fence(VkFence fence, const char *who)
+{
+    VkResult r = vkWaitForFences(V.dev, 1, &fence, VK_TRUE, UINT64_MAX);
+    if (r != VK_SUCCESS && !qatomic_xchg(&V.lost, true)) {
+        error_report("ppc-mac-gpu vulkan: %s: waiting for the GPU failed "
+                     "(VkResult %d%s); 3D rendering has stopped", who, (int)r,
+                     r == VK_ERROR_DEVICE_LOST ? ", device lost" : "");
+    }
+}
+
 static void *vk_waiter(void *opaque)
 {
     for (;;) {
@@ -751,7 +835,7 @@ static void *vk_waiter(void *opaque)
         VkWaitItem *it = g_queue_peek_head(V.waitq);
         qemu_mutex_unlock(&V.lock);
 
-        vkWaitForFences(V.dev, 1, &it->fence, VK_TRUE, UINT64_MAX);
+        vk_wait_fence(it->fence, "fence");
         vk_set_done(it->seq);
         if (it->done) {
             it->done(it->arg, it->seq);
@@ -913,6 +997,7 @@ static void *vk_arena(VkDeviceSize len, VkBuffer *buf, VkDeviceSize *off)
             c->size = MAX(len, (VkDeviceSize)VK_ARENA_CHUNK);
             if (!vk_buffer(c->size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                           VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0,
@@ -1199,9 +1284,10 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
         }
         VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                                  (cls == IMG_RT ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                                                   VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT
-                                                 : VK_IMAGE_USAGE_SAMPLED_BIT);
+                                  (cls != IMG_RT ? VK_IMAGE_USAGE_SAMPLED_BIT :
+                                   V.interlock ? VK_IMAGE_USAGE_STORAGE_BIT
+                                               : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                                 VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
         if (!vk_image(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, fmt, w, h, 1, 1, 1, usage,
                       &im->img, &im->mem, &im->view)) {
             return NULL;
@@ -1396,7 +1482,7 @@ static bool vk_flush_r200(void *opaque)
         return false;
     }
     /* A barrier opens every batch, so the newest finishing means all did. */
-    vkWaitForFences(V.dev, 1, &newest->fence, VK_TRUE, UINT64_MAX);
+    vk_wait_fence(newest->fence, "flush");
     vk_set_done(newest->seq);
     V.stat_flushes++;
     return true;
@@ -1445,6 +1531,24 @@ static void vk_set_dirty_source(void *opaque, PPCMacGPUDirtyFn fn, void *arg)
 
 /* ---- render passes, framebuffers, pipelines --------------------------- */
 
+/* How a draw writes and reads the buffers it renders to. */
+static VkPipelineStageFlags vk_fb_wstage(void)
+{
+    return V.interlock ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                       : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+}
+
+static VkAccessFlags vk_fb_waccess(void)
+{
+    return V.interlock ? VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+}
+
+static VkAccessFlags vk_fb_raccess(void)
+{
+    return V.interlock ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+                       : VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+}
+
 static VkRenderPass vk_render_pass(uint32_t n, const VkFormat *fmt)
 {
     VkAttachmentDescription ad[VK_MAX_ATT];
@@ -1468,20 +1572,23 @@ static VkRenderPass vk_render_pass(uint32_t n, const VkFormat *fmt)
         };
         ref[k] = (VkAttachmentReference){ k, VK_IMAGE_LAYOUT_GENERAL };
     }
+    /* Interlocked, the shader reaches the buffers as storage images and
+     * the pass has no attachments: a framebuffer size and nothing else. */
+    uint32_t na = V.interlock ? 0 : n;
     VkSubpassDescription sd = {
         .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
-        .inputAttachmentCount = n,
+        .inputAttachmentCount = na,
         .pInputAttachments = ref,
-        .colorAttachmentCount = n,
+        .colorAttachmentCount = na,
         .pColorAttachments = ref,
     };
     VkSubpassDependency dep[3] = {
         {   /* between draws: writes before the next draw's input reads */
             .srcSubpass = 0, .dstSubpass = 0,
-            .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .srcStageMask = vk_fb_wstage(),
             .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,
+            .srcAccessMask = vk_fb_waccess(),
+            .dstAccessMask = vk_fb_raccess(),
             .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT,
         },
         {
@@ -1501,7 +1608,7 @@ static VkRenderPass vk_render_pass(uint32_t n, const VkFormat *fmt)
     };
     VkRenderPassCreateInfo rci = {
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-        .attachmentCount = n,
+        .attachmentCount = na,
         .pAttachments = ad,
         .subpassCount = 1,
         .pSubpasses = &sd,
@@ -1543,7 +1650,7 @@ static VkFramebuffer vk_framebuffer(VkRenderPass rp, uint32_t n, VkImg **att,
     VkFramebufferCreateInfo fci = {
         .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
         .renderPass = rp,
-        .attachmentCount = n,
+        .attachmentCount = V.interlock ? 0 : n,
         .pAttachments = views,
         .width = w,
         .height = h,
@@ -1588,9 +1695,50 @@ static VkShaderModule vk_module(VkProg *pg, const char *glsl, R300Stage stage)
     return pg->mod[stage];
 }
 
-static VkPipeline vk_pipeline(const char *glsl, const VkPipeKey *key)
+/* The GPU vertex program vs_glsl (id vs_id), compiled once. */
+static VkShaderModule vk_vs_module(const char *vs_glsl, uint32_t vs_id)
 {
-    VkProg *pg = g_hash_table_lookup(V.progs, glsl);
+    gpointer m;
+    if (g_hash_table_lookup_extended(V.vs_mods, GUINT_TO_POINTER(vs_id), NULL, &m)) {
+        return (VkShaderModule)m;
+    }
+    size_t nw;
+    char *err = NULL;
+    VkShaderModule mod = VK_NULL_HANDLE;
+    uint32_t *spv = r300_glsl_to_spirv(vs_glsl, R300_STAGE_VS, &nw, &err);
+    if (!spv) {
+        qemu_log("ppc-mac-gpu vulkan: GPU vertex program: %s\n%s\n", err, vs_glsl);
+        free(err);
+    } else {
+        VkShaderModuleCreateInfo mci = {
+            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .codeSize = nw * 4,
+            .pCode = spv,
+        };
+        if (vkCreateShaderModule(V.dev, &mci, NULL, &mod) != VK_SUCCESS) {
+            mod = VK_NULL_HANDLE;
+        }
+        free(spv);
+    }
+    g_hash_table_insert(V.vs_mods, GUINT_TO_POINTER(vs_id), (gpointer)mod);
+    return mod;
+}
+
+static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id,
+                              const char *vs_glsl, const VkPipeKey *key)
+{
+    /*
+     * glsl_id (r300_us_glsl_cached) names one source text for good, so a
+     * hit skips hashing and comparing the whole GLSL string -- several
+     * kilobytes, twice per draw, 6% of the time in Quake III on x86.
+     */
+    VkProg *pg = NULL;
+    if (glsl_id && V.prog_slot[glsl_id & 255].id == glsl_id) {
+        pg = V.prog_slot[glsl_id & 255].pg;
+    }
+    if (!pg) {
+        pg = g_hash_table_lookup(V.progs, glsl);
+    }
 
     if (!pg) {
         pg = g_new0(VkProg, 1);
@@ -1601,13 +1749,18 @@ static VkPipeline vk_pipeline(const char *glsl, const VkPipeKey *key)
                      g_hash_table_size(V.progs));
         }
     }
+    if (glsl_id) {
+        V.prog_slot[glsl_id & 255].id = glsl_id;
+        V.prog_slot[glsl_id & 255].pg = pg;
+    }
     for (guint i = 0; i < pg->pipes->len; i++) {
         VkPipeVar *pv = &g_array_index(pg->pipes, VkPipeVar, i);
         if (!memcmp(&pv->key, key, sizeof(*key))) {
             return pv->pipe;
         }
     }
-    VkShaderModule vs = vk_module(pg, glsl, R300_STAGE_VS);
+    VkShaderModule vs = key->vs_id ? vk_vs_module(vs_glsl, key->vs_id)
+                                   : vk_module(pg, glsl, R300_STAGE_VS);
     VkShaderModule fs = vk_module(pg, glsl, key->z ? R300_STAGE_FS_Z : R300_STAGE_FS);
     if (!vs || !fs) {
         return VK_NULL_HANDLE;
@@ -1652,7 +1805,7 @@ static VkPipeline vk_pipeline(const char *glsl, const VkPipeKey *key)
     }
     VkPipelineColorBlendStateCreateInfo cb = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-        .attachmentCount = natt,
+        .attachmentCount = V.interlock ? 0 : natt,
         .pAttachments = cba,
     };
     VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
@@ -2110,9 +2263,12 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
               (pkt->cull & R300_CULL_BACK) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
     pk.front = r300_front_ccw(pkt->cull) ? VK_FRONT_FACE_COUNTER_CLOCKWISE
                                          : VK_FRONT_FACE_CLOCKWISE;
+    /* GPU vertex shading (R300_GLSL_GPU_VS): triangles only, no line pass */
+    bool gpu_vs = pkt->vs_glsl && pkt->vs_id;
+    pk.vs_id = gpu_vs ? pkt->vs_id : 0;
     VkPipeline pipe = VK_NULL_HANDLE, lpipe = VK_NULL_HANDLE;
     if (pkt->num_verts) {
-        pipe = vk_pipeline(pkt->glsl, &pk);
+        pipe = vk_pipeline(pkt->glsl, pkt->glsl_id, pkt->vs_glsl, &pk);
         if (!pipe) {
             return -1;
         }
@@ -2121,7 +2277,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         VkPipeKey lk = pk;
         lk.topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
         lk.cull = VK_CULL_MODE_NONE;    /* polygon-mode edges: never culled */
-        lpipe = vk_pipeline(pkt->glsl, &lk);
+        lpipe = vk_pipeline(pkt->glsl, pkt->glsl_id, NULL, &lk);
         if (!lpipe) {
             return -1;
         }
@@ -2129,16 +2285,32 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
 
     /* Per-draw data: vertices, and each sample's uniforms and shift. */
     uint32_t nv = pkt->num_verts + pkt->num_line_verts;
-    VkBuffer vb, ub;
-    VkDeviceSize vo, uo;
-    void *vp = vk_arena((VkDeviceSize)nv * sizeof(R300Vertex), &vb, &vo);
+    VkBuffer vb, ub, ib = VK_NULL_HANDLE, vub = VK_NULL_HANDLE;
+    VkDeviceSize vo, uo, io = 0, vuo = 0;
+    /* Binding 2: the expanded vertices, or for GPU vertex shading the
+     * decoded inputs (vs_in), with vs_idx as the index buffer and the
+     * vertex program's uniforms at R300_BIND_VSU. */
+    VkDeviceSize vbytes = gpu_vs ? (VkDeviceSize)MAX(pkt->vs_in_vecs, 1u) * 16
+                                 : (VkDeviceSize)nv * sizeof(R300Vertex);
+    void *vp = vk_arena(vbytes, &vb, &vo);
     VkDeviceSize ustride = ROUND_UP(sizeof(R300FSUniforms), V.align);
     VkDeviceSize mstride = V.align;
     uint8_t *up = vk_arena((ustride + mstride) * ns, &ub, &uo);
     if (!vp || !up) {
         return -1;
     }
-    memcpy(vp, pkt->verts, (size_t)nv * sizeof(R300Vertex));
+    if (gpu_vs) {
+        void *ip = vk_arena((VkDeviceSize)pkt->num_verts * 4, &ib, &io);
+        void *vup = vk_arena(sizeof(R300VSUniforms), &vub, &vuo);
+        if (!ip || !vup) {
+            return -1;
+        }
+        memcpy(vp, pkt->vs_in, (size_t)pkt->vs_in_vecs * 16);
+        memcpy(ip, pkt->vs_idx, (size_t)pkt->num_verts * 4);
+        memcpy(vup, pkt->vs_u, sizeof(R300VSUniforms));
+    } else {
+        memcpy(vp, pkt->verts, (size_t)nv * sizeof(R300Vertex));
+    }
     for (uint32_t k = 0; k < ns; k++) {
         R300FSUniforms *uk = (R300FSUniforms *)(up + k * ustride);
         float *ms = (float *)(up + ns * ustride + k * mstride);
@@ -2160,17 +2332,20 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     VkDescriptorSet set = VK_NULL_HANDLE;
     for (;;) {
         if (b->pool_cur == b->pools->len) {
-            VkDescriptorPoolSize ps[4] = {
+            VkDescriptorPoolSize ps[5] = {
+                { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SETS_PER_POOL },
                 { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2 * VK_SETS_PER_POOL },
                 { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 * VK_SETS_PER_POOL },
-                { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, VK_MAX_ATT * VK_SETS_PER_POOL },
+                { V.interlock ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                              : VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+                  VK_MAX_ATT * VK_SETS_PER_POOL },
                 { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                   R300_NUM_TEX_UNITS * VK_SETS_PER_POOL },
             };
             VkDescriptorPoolCreateInfo pci = {
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
                 .maxSets = VK_SETS_PER_POOL,
-                .poolSizeCount = 4,
+                .poolSizeCount = 5,
                 .pPoolSizes = ps,
             };
             VkDescriptorPool pool;
@@ -2193,13 +2368,14 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     VkDescriptorBufferInfo bi[6] = {
         { ub, uo, sizeof(R300FSUniforms) },
         { V.zpass_buf, 0, 16 },
-        { vb, vo, (VkDeviceSize)nv * sizeof(R300Vertex) },
+        { vb, vo, vbytes },
         { ub, uo + ns * ustride, 16 },
         { V.vram_buf, 0, VK_WHOLE_SIZE },
         { auxb, auxo, MAX(aux_bytes, 16u) },
     };
     VkDescriptorImageInfo ai[VK_MAX_ATT];
-    VkWriteDescriptorSet wr[6 + 2];
+    VkWriteDescriptorSet wr[6 + 3];
+    VkDescriptorBufferInfo vbi = { vub, vuo, sizeof(R300VSUniforms) };
     uint32_t nwr = 0;
     static const VkDescriptorType bt[6] = {
         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -2212,13 +2388,21 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             .dstSet = set, .dstBinding = i, .descriptorCount = 1,
             .descriptorType = bt[i], .pBufferInfo = &bi[i] };
     }
+    if (gpu_vs) {
+        wr[nwr++] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = set, .dstBinding = R300_BIND_VSU, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &vbi };
+    }
     for (uint32_t k = 0; k < natt; k++) {
         ai[k] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, att[k]->view, VK_IMAGE_LAYOUT_GENERAL };
     }
     wr[nwr++] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = set, .dstBinding = R300_BIND_FB0, .descriptorCount = natt,
-        .descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, .pImageInfo = ai };
+        .descriptorType = V.interlock ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                      : VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+        .pImageInfo = ai };
     wr[nwr++] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = set, .dstBinding = R300_BIND_TEX0, .descriptorCount = R300_NUM_TEX_UNITS,
@@ -2252,16 +2436,19 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         V.pass_z = pass_z;
         V.pass_z16 = z16;
         V.stat_passes++;
-    } else {
-        /* This draw reads what the previous one wrote.  MoltenVK needs it
+    } else if (!V.interlock) {
+        /* This draw reads what the previous one wrote.  (Interlocked, the
+         * ordered critical sections already chain the draws of a subpass:
+         * each one's end releases its coherent image stores to the next
+         * overlapping one's begin.)  MoltenVK needs it
          * too: without it blending read stale destination pixels (shadows,
          * translucent menus, text left garbage behind). */
         VkMemoryBarrier mb = {
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,
+            .srcAccessMask = vk_fb_waccess(),
+            .dstAccessMask = vk_fb_raccess(),
         };
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        vkCmdPipelineBarrier(cb, vk_fb_wstage(),
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                              VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, NULL, 0, NULL);
     }
@@ -2278,7 +2465,12 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.layout, 0, 1,
                                     &set, 2, dyn);
-            vkCmdDraw(cb, pkt->num_verts, 1, 0, 0);
+            if (gpu_vs) {
+                vkCmdBindIndexBuffer(cb, ib, io, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(cb, pkt->num_verts, 1, 0, 0, 0);
+            } else {
+                vkCmdDraw(cb, pkt->num_verts, 1, 0, 0);
+            }
         }
         if (pkt->num_line_verts) {
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, lpipe);
@@ -2337,7 +2529,7 @@ static uint32_t vk_get_caps(void *opaque)
 
 static PPCMacGPURenderer vulkan_renderer = {
     .name             = "vulkan",
-    .r300_glsl_flags  = R300_GLSL_VRAM_SSBO,
+    .r300_glsl_flags  = R300_GLSL_VRAM_SSBO | R300_GLSL_GPU_VS,
     .init             = vk_init,
     .fini             = vk_fini,
     .draw_r300        = vk_draw_r300,
