@@ -8910,18 +8910,154 @@ static MTLPixelFormat r300_raw_pf(uint32_t view_bpp)
  * unit's layout and a hash of its bytes, so unchanged textures cost a
  * hash, not an upload.
  */
-#define R300_TCACHE 48
+/*
+ * Entries are found by the unit's layout (where and what the texture is)
+ * through a hash index, and the content hash decides whether the copy is
+ * still current; a texture whose bytes changed is replaced in place.  It
+ * held 48 textures, fewer than a Quake III frame binds: ~6,000 of its
+ * ~9,000 lookups a second missed and rebuilt the texture.  Now up to
+ * R300_TCACHE entries within R300_TCACHE_BYTES of texel data, LRU.
+ */
+#define R300_TCACHE 1024
+#define R300_TCACHE_IDX 4096                    /* power of two */
+#define R300_TCACHE_BYTES (512ull << 20)
 typedef struct R300TexCacheKey {
     uint32_t addr, format, kind, width, height, depth, dim, levels, pitch;
     uint32_t host;
-    uint64_t hash;
 } R300TexCacheKey;
 static struct {
     R300TexCacheKey key;
+    uint64_t hash;                              /* of the texels it holds */
     id<MTLTexture> tex;
-    uint64_t used;
+    uint64_t used;                              /* 0: free */
+    uint64_t bytes;
+    uint64_t gen;                               /* r300_tex_gen when hashed */
+    bool gen_ok;                                /* gen can vouch for it */
 } g_r300_tcache[R300_TCACHE];
-static uint64_t g_r300_tcache_clock;
+
+/*
+ * Skipping the hash.  Hashing every texture of every draw was the render
+ * thread's main cost, and it sits in front of every fence: Doom 3 ran 28%
+ * faster with it gone.  The device counts writes to the pages under each
+ * texture when it queues the draw (R300TexDesc.vram_gen, from the VRAM
+ * dirty log); a cached texture keeps the count it was hashed at, and the
+ * same count later means none of its bytes were written since.
+ *
+ * GPU writes are the exception: a draw marks its colour buffer dirty when
+ * it is queued, but Metal writes it later, after the mark may have been
+ * counted.  So a texture copied while an in-flight batch writes its bytes
+ * is not vouched for; the next use hashes it again.  PPCGPU_TEX_DIRTY=0
+ * hashes every time, as before.
+ */
+/*
+ * PPCGPU_TEX_VERIFY=N: hash every Nth texture the write count vouches for
+ * anyway, and report any whose bytes changed regardless -- a writer the
+ * dirty log did not see.  Off (0) by default; it costs a hash per check.
+ */
+static void r300_tex_verify(const R300TexCacheKey *key, uint64_t hash,
+                            const uint8_t *src, uint32_t size)
+{
+    static int every = -1;
+    static uint64_t n, checked, wrong;
+    if (every < 0) {
+        const char *e = getenv("PPCGPU_TEX_VERIFY");
+        every = e ? atoi(e) : 0;
+    }
+    if (every <= 0 || ++n % every) {
+        return;
+    }
+    checked++;
+    if (r300_hash_bytes(src, size) != hash) {
+        wrong++;
+        if (wrong <= 16) {
+            fprintf(stderr, "ppc-mac-gpu: texture at %06x (%ux%u fmt %u, %u "
+                    "bytes) changed without a dirty-log write\n", key->addr,
+                    key->width, key->height, key->format, size);
+        }
+    }
+    if (!(checked % 10000)) {
+        fprintf(stderr, "ppc-mac-gpu: texture verify %" PRIu64 " checked, %"
+                PRIu64 " changed unseen\n", checked, wrong);
+    }
+}
+
+static bool r300_tex_gen(const R300TexDesc *td, uint64_t *gen)
+{
+    uint64_t lo = td->gpu_addr, hi = lo + td->size_bytes;
+
+    if (!td->vram_gen_ok) {
+        return false;
+    }
+    for (int i = 0; i < g_r200_nwritten; i++) {
+        if (lo < g_r200_written[i].hi && g_r200_written[i].lo < hi) {
+            return false;                       /* the GPU may still write it */
+        }
+    }
+    *gen = td->vram_gen;
+    return true;
+}
+static uint16_t g_r300_tcache_idx[R300_TCACHE_IDX];    /* slot + 1, 0 none */
+static uint64_t g_r300_tcache_clock, g_r300_tcache_bytes;
+
+static uint32_t r300_tcache_bucket(const R300TexCacheKey *k)
+{
+    uint64_t h = r300_hash_bytes((const uint8_t *)k, sizeof(*k));
+    return (uint32_t)h & (R300_TCACHE_IDX - 1);
+}
+
+/* The slot holding layout k, or -1. */
+static int r300_tcache_find(const R300TexCacheKey *k)
+{
+    uint16_t v = g_r300_tcache_idx[r300_tcache_bucket(k)];
+    if (v && g_r300_tcache[v - 1].used &&
+        !memcmp(&g_r300_tcache[v - 1].key, k, sizeof(*k))) {
+        return v - 1;
+    }
+    for (int i = 0; i < R300_TCACHE; i++) {     /* bucket collision */
+        if (g_r300_tcache[i].used && !memcmp(&g_r300_tcache[i].key, k, sizeof(*k))) {
+            g_r300_tcache_idx[r300_tcache_bucket(k)] = i + 1;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void r300_tcache_drop(int i)
+{
+    g_r300_tcache_bytes -= g_r300_tcache[i].bytes;
+    [g_r300_tcache[i].tex release];
+    g_r300_tcache[i].tex = nil;
+    g_r300_tcache[i].used = 0;
+    g_r300_tcache[i].bytes = 0;
+}
+
+/* A slot for a new texture of @bytes, evicting least recently used. */
+static int r300_tcache_slot(uint64_t bytes)
+{
+    /* PPCGPU_TCACHE=n caps the entries (48 was the old size). */
+    static int cap = -1;
+    if (cap < 0) {
+        const char *e = getenv("PPCGPU_TCACHE");
+        cap = e && atoi(e) > 0 ? MIN(atoi(e), R300_TCACHE) : R300_TCACHE;
+    }
+    for (;;) {
+        int lru = -1, free_ = -1;
+        for (int i = 0; i < cap; i++) {
+            if (!g_r300_tcache[i].used) {
+                free_ = i;
+            } else if (lru < 0 || g_r300_tcache[i].used < g_r300_tcache[lru].used) {
+                lru = i;
+            }
+        }
+        if (free_ >= 0 && g_r300_tcache_bytes + bytes <= R300_TCACHE_BYTES) {
+            return free_;
+        }
+        if (lru < 0) {
+            return free_;
+        }
+        r300_tcache_drop(lru);
+    }
+}
 
 static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> dev,
                                         uint8_t *vram_ptr, const R300TexDesc *td)
@@ -8948,18 +9084,30 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
         r200_flush_locked(st);
     }
 
-    R300TexCacheKey key = { td->gpu_addr, td->format, td->kind, td->width, td->height,
-                            td->depth, td->dim, td->levels, td->pitch_bytes,
-                            td->host_data != NULL, r300_hash_bytes(src, td->size_bytes) };
-    int lru = 0;
-    for (int i = 0; i < R300_TCACHE; i++) {
-        if (g_r300_tcache[i].tex && !memcmp(&g_r300_tcache[i].key, &key, sizeof(key))) {
-            g_r300_tcache[i].used = ++g_r300_tcache_clock;
-            return g_r300_tcache[i].tex;
+    R300TexCacheKey key;
+    memset(&key, 0, sizeof(key));
+    key = (R300TexCacheKey){ td->gpu_addr, td->format, td->kind, td->width, td->height,
+                             td->depth, td->dim, td->levels, td->pitch_bytes,
+                             td->host_data != NULL };
+    uint64_t gen = 0;
+    bool gen_ok = !td->host_data && r300_tex_gen(td, &gen);
+    int hit = r300_tcache_find(&key);
+    if (hit >= 0 && gen_ok && g_r300_tcache[hit].gen_ok &&
+        g_r300_tcache[hit].gen == gen) {
+        g_r300_tcache[hit].used = ++g_r300_tcache_clock;
+        r300_tex_verify(&g_r300_tcache[hit].key, g_r300_tcache[hit].hash,
+                        src, td->size_bytes);
+        return g_r300_tcache[hit].tex;          /* not written since */
+    }
+    uint64_t hash = r300_hash_bytes(src, td->size_bytes);
+    if (hit >= 0) {
+        if (g_r300_tcache[hit].hash == hash) {
+            g_r300_tcache[hit].used = ++g_r300_tcache_clock;
+            g_r300_tcache[hit].gen = gen;
+            g_r300_tcache[hit].gen_ok = gen_ok;
+            return g_r300_tcache[hit].tex;
         }
-        if (g_r300_tcache[i].used < g_r300_tcache[lru].used) {
-            lru = i;
-        }
+        r300_tcache_drop(hit);                  /* content changed */
     }
 
     MTLTextureDescriptor *d = [[MTLTextureDescriptor alloc] init];
@@ -8997,10 +9145,19 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
             free(bytes);
         }
     }
-    [g_r300_tcache[lru].tex release];
-    g_r300_tcache[lru].key = key;
-    g_r300_tcache[lru].tex = t;
-    g_r300_tcache[lru].used = ++g_r300_tcache_clock;
+    int slot = r300_tcache_slot(td->size_bytes);
+    if (slot < 0) {
+        return [t autorelease];                 /* cannot cache it */
+    }
+    g_r300_tcache[slot].key = key;
+    g_r300_tcache[slot].hash = hash;
+    g_r300_tcache[slot].gen = gen;
+    g_r300_tcache[slot].gen_ok = gen_ok;
+    g_r300_tcache[slot].tex = t;
+    g_r300_tcache[slot].used = ++g_r300_tcache_clock;
+    g_r300_tcache[slot].bytes = td->size_bytes;
+    g_r300_tcache_bytes += td->size_bytes;
+    g_r300_tcache_idx[r300_tcache_bucket(&key)] = slot + 1;
     return t;
 }
 
@@ -9012,6 +9169,26 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
  * GART dwords byte-reversed to VRAM's side of the aperture (see
  * r300_tex_raw_bpp).
  */
+/*
+ * Set by r300_texture when what it returns is a view over VRAM, which the
+ * GPU reads when the batch runs.  Everything else (cached CPU conversions,
+ * GART uploads, copies) was read from VRAM before the draw was encoded, so
+ * a 2D write to those bytes need not wait for the batch to complete.
+ * Render thread only.  PPCGPU_TEX_READ_ALL=1 counts every texture as read
+ * by the GPU, as before.
+ */
+static bool g_r300_tex_is_view;
+
+static bool r300_tex_read_all(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_TEX_READ_ALL");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+
 static id<MTLTexture> r300_texture_raw(PPCMacGPUMetalState *st, id<MTLDevice> dev,
                                        uint8_t *vram_ptr, uint64_t vram_size,
                                        const R300TexDesc *td, uint32_t *rowel)
@@ -9026,6 +9203,7 @@ static id<MTLTexture> r300_texture_raw(PPCMacGPUMetalState *st, id<MTLDevice> de
         if (rows <= 16384 && (uint64_t)td->gpu_addr + (uint64_t)rows * p0 <= vram_size) {
             R200TexKey k = { td->gpu_addr, p0 / eb, rows, p0, (uint32_t)rpf };
             *rowel = p0 / eb;
+            g_r300_tex_is_view = true;
             return r200_view(st, k, rpf, false);
         }
     }
@@ -9087,6 +9265,7 @@ static id<MTLTexture> r300_texture(PPCMacGPUMetalState *st, id<MTLDevice> dev,
     uint64_t hi = lo + td->size_bytes;
     MTLPixelFormat pf;
 
+    g_r300_tex_is_view = false;
     if (!td->host_data && hi > vram_size) {
         r300_metal_warn(2, "texture outside VRAM");
         return nil;
@@ -9117,6 +9296,7 @@ static id<MTLTexture> r300_texture(PPCMacGPUMetalState *st, id<MTLDevice> dev,
         }
         R200TexKey k = { td->gpu_addr, td->width, td->height, td->pitch_bytes,
                          (uint32_t)pf };
+        g_r300_tex_is_view = true;
         return r200_view(st, k, pf, false);
     }
     /* 16bpp formats and DXT: converted or copied by the CPU (cached). */
@@ -9254,6 +9434,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
 
         id<MTLTexture> tex[R300_NUM_TEX_UNITS];
         id<MTLSamplerState> smp[R300_NUM_TEX_UNITS];
+        bool tex_view[R300_NUM_TEX_UNITS] = { false };
         R300FSUniforms u = pkt->uniforms;
         for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
             const R300TexDesc *td = &pkt->tex[t];
@@ -9266,6 +9447,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             }
             uint32_t rowel = u.tex_info[t][1];
             id<MTLTexture> x = r300_texture(st, dev, vram_ptr, vram_size, td, &rowel);
+            tex_view[t] = g_r300_tex_is_view || r300_tex_read_all();
             if (!x) {
                 u.tex_info[t][0] = 0;
                 continue;
@@ -9453,7 +9635,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
         [ib release];
         g_r200_stat_draws++;
         for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
-            if (u.tex_info[t][0] && !pkt->tex[t].host_data) {
+            if (u.tex_info[t][0] && !pkt->tex[t].host_data && tex_view[t]) {
                 r200_note_read(pkt->tex[t].gpu_addr,
                                (uint64_t)pkt->tex[t].gpu_addr + pkt->tex[t].size_bytes);
             }
