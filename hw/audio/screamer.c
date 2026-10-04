@@ -83,6 +83,18 @@ static const char *s_spk = "screamer";
  * so the backend's timer and the DMA pacing timer can drift in phase. */
 #define SCREAMER_PRIME_MS 40
 
+/* SCREAMER_PRIME_MS=<ms> overrides the jitter buffer (for tuning); kept
+ * below the ring's capacity, or output could never start. */
+static int screamer_prime_frames(ScreamerState *s)
+{
+    static int ms = -1;
+    if (ms < 0) {
+        const char *e = getenv("SCREAMER_PRIME_MS");
+        ms = e && atoi(e) > 0 ? atoi(e) : SCREAMER_PRIME_MS;
+    }
+    return MIN((int64_t)s->rate * ms / 1000, s->samples * 3 / 4);
+}
+
 static struct {
     int64_t last;
     uint64_t pulled, written, underruns, zero_runs, zero_frames, reads[16];
@@ -172,16 +184,57 @@ static int pmac_screamer_tx_transfer(ScreamerState *s, int max)
  */
 #define SCREAMER_PACE_NS (1 * SCALE_MS)
 
+/*
+ * The pacing rate, matched to the host's audio clock.  Paced by QEMU's
+ * clock at exactly the nominal rate, DMA fell behind the host device by
+ * about 0.5% (Doom 3, CoreAudio at 44.1 kHz: ~44,300 frames/s consumed,
+ * ~44,050 delivered), so the host queue drained to a period and then came
+ * up short about twice in three seconds, whatever its depth.  On real
+ * hardware the codec clock drives DMA; here the queued level -- Screamer's
+ * ring plus the host voice's buffer, both empty while the host is starved
+ * and filling once it is not -- steers the rate within 1% of nominal,
+ * toward the jitter-buffer level.  SCREAMER_RATE_MATCH=0 paces at nominal.
+ */
+static int64_t screamer_pace_rate(ScreamerState *s)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SCREAMER_RATE_MATCH");
+        on = !(e && e[0] == '0');
+    }
+    if (!on || !s->voice || !s->primed || !s->voice_free_max) {
+        return s->rate;
+    }
+    int64_t target = screamer_prime_frames(s);
+    /* The space the audio core offers is largest when it has nothing
+     * queued (its scale is its mix buffer's, not the voice's size). */
+    int64_t level = (int64_t)(s->wpos - s->rpos) +
+                    ((s->voice_free_max - s->voice_free) >> s->shift);
+    int64_t err = MAX(MIN(target - level, target), -target);
+    return s->rate + (int64_t)s->rate * err / (100 * target);
+}
+
 static void screamer_pace_cb(void *opaque)
 {
     ScreamerState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    s->pace_frac += (now - s->pace_last) * (int64_t)s->rate;
+    s->pace_frac += (now - s->pace_last) * screamer_pace_rate(s);
     s->pace_last = now;
     int64_t due = s->pace_frac / NANOSECONDS_PER_SECOND;
     s->pace_frac -= due * NANOSECONDS_PER_SECOND;
-    due = MIN(due, (int64_t)s->rate / 20);    /* at most 50 ms after a stall */
+    /*
+     * At most 50 ms of DMA a tick, but what a stall left over is owed, not
+     * forgiven: dropping it shrank the buffered audio by the excess after
+     * every long main-loop stall, until the host queue ran short at the
+     * slightest delay.  Up to 250 ms is carried to the next ticks; a longer
+     * stall drops the rest rather than burst through the guest's ring.
+     */
+    if (due > (int64_t)s->rate / 20) {
+        int64_t owed = MIN(due - s->rate / 20, (int64_t)s->rate / 4);
+        s->pace_frac += owed * NANOSECONDS_PER_SECOND;
+        due = s->rate / 20;
+    }
 
     int moved = 0;
     while (due > 0 && s->io.len) {
@@ -301,6 +354,8 @@ static void screamerspk_callback(void *opaque, int free_b)
     ScreamerState *s = opaque;
     int samples, generated;
 
+    s->voice_free = free_b;
+    s->voice_free_max = MAX(s->voice_free_max, free_b);
     if (free_b == 0) {
         return;
     }
@@ -314,7 +369,7 @@ static void screamerspk_callback(void *opaque, int free_b)
         return;
     }
     if (!s->primed) {
-        if (s->wpos - s->rpos < s->rate * SCREAMER_PRIME_MS / 1000) {
+        if (s->wpos - s->rpos < screamer_prime_frames(s)) {
             return;
         }
         s->primed = true;
@@ -370,6 +425,7 @@ static void screamer_update_settings(ScreamerState *s)
         AUD_log(s_spk, "Could not open voice\n");
         return;
     }
+    s->voice_free = s->voice_free_max = 0;
     AUD_set_active_out(s->voice, true);
 }
 
@@ -459,22 +515,16 @@ static void screamer_codec_write(ScreamerState *s, hwaddr addr, uint64_t val)
 {
     //SCREAMER_DPRINTF("%s: addr " HWADDR_PRIx " val %" PRIx64 "\n", __func__, addr, val);
 
-    switch (addr) {
-    case 0x1:
-        /* Clear recalibrate if set */
-        val = val & ~CODEC_CTRL1_RECALIBRATE;    
-
-        /* Update volume in case mute set */
-        screamer_update_volume(s);
-        break;
-
-    case 0x4:
-        /* Speaker attenuation */
-        screamer_update_volume(s);
-        break;
+    if (addr == 0x1) {
+        val = val & ~CODEC_CTRL1_RECALIBRATE;   /* clear recalibrate if set */
     }
-    
     s->codec_ctrl_regs[addr] = val;
+
+    /* Mute (register 1) and speaker attenuation (register 4) take effect
+     * from the value just written, not the one it replaced. */
+    if (addr == 0x1 || addr == 0x4) {
+        screamer_update_volume(s);
+    }
 }
 
 static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
@@ -543,6 +593,11 @@ static void screamer_write(void *opaque, hwaddr addr,
     case CODEC_STAT_REG:
     case CLIP_CNT_REG:
     case BYTE_SWAP_REG:
+        s->regs[addr] = val & 0xffffffff;
+        break;
+    case FRAME_CNT_REG:
+        /* AppleScreamerAudio zeroes it before starting output DMA, and its
+         * engine times the stream from it. */
         s->regs[addr] = val & 0xffffffff;
         break;
     default:
