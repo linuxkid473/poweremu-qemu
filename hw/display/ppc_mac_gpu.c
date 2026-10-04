@@ -1599,12 +1599,12 @@ static void ppc_mac_gpu_bswap_line32(uint32_t *restrict dst,
         vst1q_u8((uint8_t *)(dst + i + 12), d);
     }
 #elif defined(__SSE2__)
-    const __m128i m = _mm_set1_epi32(0x00FF00FF);
+    /* swap the 16-bit halves, then the bytes within each half (the 16-bit
+     * shifts drop the bytes they move out, so no masks are needed) */
     for (; i + 4 <= width; i += 4) {
         __m128i v = _mm_loadu_si128((const __m128i *)(src + i));
         v = _mm_or_si128(_mm_srli_epi32(v, 16), _mm_slli_epi32(v, 16));
-        v = _mm_or_si128(_mm_slli_epi16(_mm_and_si128(v, m), 8),
-                         _mm_srli_epi16(_mm_and_si128(v, m), 8));
+        v = _mm_or_si128(_mm_slli_epi16(v, 8), _mm_srli_epi16(v, 8));
         _mm_storeu_si128((__m128i *)(dst + i), v);
     }
 #endif
@@ -12300,6 +12300,17 @@ static void ppc_mac_gpu_vram_dirty(void *arg, unsigned long *bitmap,
 {
     PPCMacGPUState *s = arg;
     const uint64_t pg = PPC_MAC_GPU_DIRTY_PAGE, chunk = 256 * pg;
+
+    /*
+     * The Vulkan renderer asks before every draw, and usually nothing was
+     * written since.  Snapshotting and clearing the whole log re-arms
+     * dirty tracking in every vCPU TLB entry (tlb_reset_dirty): 12% of
+     * the time in Quake III on x86 at thousands of draws a second.  A
+     * read-only look at the bitmap first is a scan of a few hundred words.
+     */
+    if (!memory_region_any_dirty(&s->vram, 0, s->vram_size, DIRTY_MEMORY_VGA)) {
+        return;
+    }
     DirtyBitmapSnapshot *snap =
         memory_region_snapshot_and_clear_dirty(&s->vram, 0, s->vram_size,
                                                DIRTY_MEMORY_VGA);
@@ -12726,9 +12737,8 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
                 s->renderer = NULL;
             }
         }
-        if (!s->renderer)
 #endif
-        {
+        if (!s->renderer) {
             s->renderer = ppc_mac_gpu_renderer_sw();
             s->renderer_opaque = s->renderer->init(vram_ptr, s->vram_size);
             qemu_log("ppc-mac-gpu: using software renderer (3D textured quad)\n");
