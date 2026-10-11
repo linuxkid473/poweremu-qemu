@@ -41,4 +41,12 @@ char *r300_spirv_to_msl(const uint32_t *spv, size_t nwords, R300Stage stage,
 /* Both steps. */
 char *r300_glsl_to_msl(const char *glsl, R300Stage stage, char **err);
 
+/*
+ * Names everything that decides what r300_glsl_to_msl() returns for a given
+ * source besides the source itself: the shaderc and SPIRV-Cross builds
+ * linked in and when this converter was compiled.  An on-disk cache of its
+ * output keys on this, so changing any of them starts a fresh cache.
+ */
+const char *r300_msl_toolchain_id(void);
+
 #endif

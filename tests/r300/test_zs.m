@@ -19,6 +19,8 @@ static int fails;
 #define CHECK(c, ...) do { if (!(c)) { printf("FAIL %s:%d: ", __FILE__, __LINE__); \
     printf(__VA_ARGS__); printf("\n"); fails++; } } while (0)
 
+static unsigned g_ninst = 1;
+
 /* US program: out = t0 (the colour varying), rgb and alpha. */
 static char *make_msl(void)
 {
@@ -29,11 +31,15 @@ static char *make_msl(void)
     r300_state_reset(&st);
     r300_state_write(&st, 0x4600, 0);                   /* US_CONFIG: 1 node */
     r300_state_write(&st, 0x4608, 0);                   /* US_CODE_OFFSET */
-    r300_state_write(&st, 0x461C, 0);                   /* CODE_ADDR_3: alu 0, 1 inst */
-    r300_state_write(&st, 0x46C0, (7u << 26));          /* rgb: src0 t0, out rgb */
-    r300_state_write(&st, 0x48C0, 0 | (21u << 7) | (20u << 14)); /* MAD t0.rgb * 1 + 0 */
-    r300_state_write(&st, 0x47C0, (1u << 24));          /* alpha: src0 t0, out a */
-    r300_state_write(&st, 0x49C0, 9 | (17u << 7) | (16u << 14));
+    r300_state_write(&st, 0x461C, (g_ninst - 1) << 6);  /* CODE_ADDR_3: alu 0, g_ninst inst */
+    for (unsigned k = 0; k < g_ninst; k++) {
+        /* The same MAD g_ninst times: a long program takes the generated
+         * early Z/stencil reject; a short one does not. */
+        r300_state_write(&st, 0x46C0 + 4 * k, (7u << 26));  /* rgb: src0 t0, out rgb */
+        r300_state_write(&st, 0x48C0 + 4 * k, 0 | (21u << 7) | (20u << 14)); /* MAD t0.rgb * 1 + 0 */
+        r300_state_write(&st, 0x47C0 + 4 * k, (1u << 24));  /* alpha: src0 t0, out a */
+        r300_state_write(&st, 0x49C0 + 4 * k, 9 | (17u << 7) | (16u << 14));
+    }
     memset(d.route, -1, sizeof(d.route));
     d.route[0] = 0;
     char *m = r300_us_to_glsl(&st, &d, 0, &err);
@@ -169,8 +175,9 @@ static const float RED[4] = { 1, 0, 0, 1 }, GREEN[4] = { 0, 1, 0, 1 }, BLUE[4] =
 #define PGREEN 0xFF00FF00u
 #define PBLUE 0xFFFF0000u
 
-int main(void)
+static int run(void)
 {
+    fails = 0;
     @autoreleasepool {
         dev = MTLCreateSystemDefaultDevice();
         q = [dev newCommandQueue];
@@ -295,6 +302,36 @@ int main(void)
             draw(&t3, p32, &u, v, 12, R300_CULL_BACK | R300_FACE_CW);
             CHECK(px(&t3, 5, 5) == 0 && px(&t3, 40, 5) == PGREEN, "cull back, CW front");
         }
+        /* 6b. Z fails but the stencil Z-fail op rewrites the stencil (shadow
+         * volumes, "Carmack's reverse"): the early reject must not skip it. */
+        {
+            Target t = make_target(false, 0x40000000u);     /* Z 0.25, stencil 0 */
+            R300FSUniforms u = base_uniforms();
+            u.zinfo[0] = 1 | 2;                             /* stencil + Z test, no write */
+            u.zinfo[1] = 1 | (7u << 3) | (6u << 12);        /* LESS; ALWAYS; zfail INCR_WRAP */
+            u.zinfo[2] = 0x00FF00FFu;                       /* ref 0xFF mask 0, write all */
+            rect(v, 8, 8, 40, 40, 0.75f, RED, true);        /* behind: Z fails */
+            draw(&t, p32, &u, v, 6, 0);
+            CHECK(px(&t, 20, 20) == 0, "zfail colour %08x want untouched", px(&t, 20, 20));
+            CHECK(zw(&t, 20, 20) >> 8 == 0x400000, "zfail z %08x", zw(&t, 20, 20));
+            CHECK((zw(&t, 20, 20) & 0xFF) == 1, "zfail INCR stencil %08x", zw(&t, 20, 20));
+            draw(&t, p32, &u, v, 6, 0);
+            CHECK((zw(&t, 20, 20) & 0xFF) == 2, "zfail INCR again %08x", zw(&t, 20, 20));
+        }
+        /* 6c. The same, but the alpha test kills the fragment before any of
+         * it: neither colour, Z nor stencil may change. */
+        {
+            Target t = make_target(false, 0x40000000u);
+            R300FSUniforms u = base_uniforms();
+            u.zinfo[0] = 1 | 2;
+            u.zinfo[1] = 1 | (7u << 3) | (6u << 12);
+            u.zinfo[2] = 0x00FF00FFu;
+            u.alpha_func = 1u << 11;                        /* alpha test on, func NEVER */
+            rect(v, 8, 8, 40, 40, 0.75f, RED, true);
+            draw(&t, p32, &u, v, 6, 0);
+            CHECK(px(&t, 20, 20) == 0, "killed colour %08x", px(&t, 20, 20));
+            CHECK(zw(&t, 20, 20) == 0x40000000u, "killed z/stencil %08x", zw(&t, 20, 20));
+        }
         /* 7. Z-pass counter: a 10x10 quad, half hidden. */
         {
             Target t = make_target(false, 0xFFFFFF00u);
@@ -309,7 +346,23 @@ int main(void)
             uint32_t n = *(uint32_t *)g_zp.contents;
             CHECK(n == 50, "zpass count %u want 50", n);
         }
-        printf(fails ? "test_zs: %d FAILED\n" : "test_zs: PASS\n", fails);
+        if (fails) {
+            printf("test_zs (%u inst): %d FAILED\n", g_ninst, fails);
+        } else {
+            printf("test_zs (%u inst): PASS\n", g_ninst);
+        }
     }
     return fails != 0;
+}
+
+int main(void)
+{
+    /* 1 ALU instruction, then 10: past the threshold for the early test. */
+    int bad = 0;
+
+    g_ninst = 1;
+    bad |= run();
+    g_ninst = 10;
+    bad |= run();
+    return bad;
 }

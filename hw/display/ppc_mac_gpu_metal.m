@@ -30,6 +30,7 @@
 
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#import <CommonCrypto/CommonDigest.h>
 
 #include "ppc_mac_gpu_renderer.h"
 #include "r300/r300_draw.h"
@@ -8688,6 +8689,152 @@ static void r300_metal_warn(uint32_t bit, const char *msg)
  */
 static NSMutableDictionary<NSString *, id<MTLFunction>> *g_r300_fns;
 
+/*
+ * On-disk cache of the GLSL -> SPIR-V -> MSL step (shaderc and SPIRV-Cross
+ * are the slow half of a first-time shader; a game uses hundreds of them and
+ * every launch used to redo all of it).  One file per (toolchain, stage,
+ * source), named by the SHA-256 of those, holding the MSL and a trailing
+ * marker so a file cut short is a miss.  Files are written under a private
+ * name and renamed into place, so concurrent launches never see half of one.
+ * PPCGPU_MSL_CACHE=0 turns it off.  Stale or damaged entries are harmless:
+ * MSL that fails to compile is deleted and regenerated.
+ */
+#define MSL_CACHE_END "\n// ppcosxkvm-msl-end\n"
+#define MSL_CACHE_MAX_FILES 8192
+
+static NSString *g_msl_cache_dir;
+static uint64_t g_msl_hits, g_msl_misses, g_msl_load_us, g_msl_conv_us;
+
+static void msl_cache_prune(NSFileManager *fm, NSString *dir)
+{
+    NSArray<NSString *> *names = [fm contentsOfDirectoryAtPath:dir error:NULL];
+
+    if (names.count <= MSL_CACHE_MAX_FILES) {
+        return;
+    }
+    NSMutableArray<NSArray *> *aged = [NSMutableArray array];
+    for (NSString *n in names) {
+        NSString *path = [dir stringByAppendingPathComponent:n];
+        NSDate *d = [fm attributesOfItemAtPath:path error:NULL].fileModificationDate;
+        [aged addObject:@[ path, d ?: [NSDate distantPast] ]];
+    }
+    [aged sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) {
+        return [a[1] compare:b[1]];
+    }];
+    /* drop the oldest quarter */
+    for (NSUInteger i = 0; i < aged.count / 4; i++) {
+        [fm removeItemAtPath:aged[i][0] error:NULL];
+    }
+}
+
+static NSString *msl_cache_dir(void)
+{
+    static dispatch_once_t once;
+
+    dispatch_once(&once, ^{
+        const char *off = getenv("PPCGPU_MSL_CACHE");
+        if (off && !strcmp(off, "0")) {
+            return;
+        }
+        @autoreleasepool {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSString *dir = [[NSSearchPathForDirectoriesInDomains(
+                                  NSCachesDirectory, NSUserDomainMask, YES).firstObject
+                              stringByAppendingPathComponent:@"ppcosxkvm"]
+                             stringByAppendingPathComponent:@"msl"];
+            if ([fm createDirectoryAtPath:dir withIntermediateDirectories:YES
+                               attributes:nil error:NULL]) {
+                msl_cache_prune(fm, dir);
+                g_msl_cache_dir = [dir copy];
+            }
+        }
+    });
+    return g_msl_cache_dir;
+}
+
+/* The cache file for this source and stage, or nil when the cache is off. */
+static NSString *msl_cache_path(const char *glsl, R300Stage stage)
+{
+    NSString *dir = msl_cache_dir();
+    CC_SHA256_CTX c;
+    unsigned char md[CC_SHA256_DIGEST_LENGTH];
+    char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
+    const char *tc = r300_msl_toolchain_id();
+    unsigned char st = (unsigned char)stage;
+
+    if (!dir) {
+        return nil;
+    }
+    CC_SHA256_Init(&c);
+    CC_SHA256_Update(&c, tc, (CC_LONG)strlen(tc) + 1);
+    CC_SHA256_Update(&c, &st, 1);
+    CC_SHA256_Update(&c, glsl, (CC_LONG)strlen(glsl));
+    CC_SHA256_Final(md, &c);
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
+        snprintf(hex + 2 * i, 3, "%02x", md[i]);
+    }
+    return [dir stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"%s.%s.metal", hex, r300_stage_entry(stage)]];
+}
+
+/* The cached MSL (malloc'd), or NULL. */
+static char *msl_cache_load(NSString *path)
+{
+    static const char end[] = MSL_CACHE_END;
+    const size_t en = sizeof(end) - 1;
+    NSData *d = [NSData dataWithContentsOfFile:path];
+    char *msl;
+
+    if (d.length <= en || memcmp((const char *)d.bytes + d.length - en, end, en)) {
+        return NULL;
+    }
+    msl = malloc(d.length + 1);
+    memcpy(msl, d.bytes, d.length);
+    msl[d.length] = 0;
+    return msl;
+}
+
+static void msl_cache_store(NSString *path, const char *msl)
+{
+    static const char end[] = MSL_CACHE_END;
+    NSString *tmp = [path stringByAppendingFormat:@".%d.%x.tmp", getpid(),
+                     (unsigned)pthread_mach_thread_np(pthread_self())];
+    FILE *f = fopen(tmp.fileSystemRepresentation, "wb");
+    bool ok;
+
+    if (!f) {
+        return;
+    }
+    ok = fwrite(msl, 1, strlen(msl), f) == strlen(msl) &&
+         fwrite(end, 1, sizeof(end) - 1, f) == sizeof(end) - 1;
+    ok = fclose(f) == 0 && ok;
+    if (!ok || rename(tmp.fileSystemRepresentation, path.fileSystemRepresentation)) {
+        unlink(tmp.fileSystemRepresentation);
+    }
+}
+
+static void msl_cache_note(bool hit, int64_t us)
+{
+    uint64_t n;
+
+    if (hit) {
+        g_msl_hits++;
+        g_msl_load_us += us;
+    } else {
+        g_msl_misses++;
+        g_msl_conv_us += us;
+    }
+    n = g_msl_hits + g_msl_misses;
+    if (n == 1 || n % 100 == 0) {
+        qemu_log("ppc-mac-gpu r300: MSL cache %llu hits (%llu us each) / %llu "
+                 "converted (%llu us each)\n",
+                 (unsigned long long)g_msl_hits,
+                 (unsigned long long)(g_msl_hits ? g_msl_load_us / g_msl_hits : 0),
+                 (unsigned long long)g_msl_misses,
+                 (unsigned long long)(g_msl_misses ? g_msl_conv_us / g_msl_misses : 0));
+    }
+}
+
 static id<MTLFunction> r300_function(id<MTLDevice> dev, NSString *glsl,
                                      R300Stage stage)
 {
@@ -8703,28 +8850,59 @@ static id<MTLFunction> r300_function(id<MTLDevice> dev, NSString *glsl,
     if (fn) {
         return fn;
     }
-    char *msl = r300_glsl_to_msl(glsl.UTF8String, stage, &msg);
-    if (!msl) {
-        qemu_log("ppc-mac-gpu r300: %s: %s\n%s\n", r300_stage_entry(stage), msg,
-                 glsl.UTF8String);
-        free(msg);
-        return nil;
-    }
-    /* Vertex programs keep IEEE infinities and NaNs, as the interpreter
-     * does (fast math broke the specials the _DX/_FF opcodes produce). */
-    MTLCompileOptions *opt = [[MTLCompileOptions alloc] init];
-    if (stage == R300_STAGE_VS) {
-        opt.mathMode = MTLMathModeSafe;
-    }
-    id<MTLLibrary> lib = [dev newLibraryWithSource:@(msl) options:opt error:&err];
-    [opt release];
-    if (!lib) {
-        qemu_log("ppc-mac-gpu r300: shader compile failed: %s\n%s\n",
-                 err.localizedDescription.UTF8String, msl);
+    NSString *cpath = msl_cache_path(glsl.UTF8String, stage);
+    char *msl = NULL;
+    bool cached = false;
+    id<MTLLibrary> lib = nil;
+
+    for (int attempt = 0; attempt < 2 && !lib; attempt++) {
+        int64_t t0 = g_get_monotonic_time();
+
+        if (attempt == 0 && cpath) {
+            msl = msl_cache_load(cpath);
+            cached = msl != NULL;
+        }
+        if (!msl) {
+            msl = r300_glsl_to_msl(glsl.UTF8String, stage, &msg);
+            if (!msl) {
+                qemu_log("ppc-mac-gpu r300: %s: %s\n%s\n", r300_stage_entry(stage), msg,
+                         glsl.UTF8String);
+                free(msg);
+                return nil;
+            }
+        }
+        msl_cache_note(cached, g_get_monotonic_time() - t0);
+        /* Vertex programs keep IEEE infinities and NaNs, as the interpreter
+         * does (fast math broke the specials the _DX/_FF opcodes produce). */
+        MTLCompileOptions *opt = [[MTLCompileOptions alloc] init];
+        if (stage == R300_STAGE_VS) {
+            opt.mathMode = MTLMathModeSafe;
+        }
+        lib = [dev newLibraryWithSource:@(msl) options:opt error:&err];
+        [opt release];
+        if (lib) {
+            if (cpath && !cached) {
+                msl_cache_store(cpath, msl);
+            }
+        } else if (cached) {
+            /* a stale or damaged entry: drop it and convert afresh */
+            unlink(cpath.fileSystemRepresentation);
+            free(msl);
+            msl = NULL;
+            cached = false;
+            continue;
+        } else {
+            qemu_log("ppc-mac-gpu r300: shader compile failed: %s\n%s\n",
+                     err.localizedDescription.UTF8String, msl);
+            free(msl);
+            return nil;
+        }
         free(msl);
+        msl = NULL;
+    }
+    if (!lib) {
         return nil;
     }
-    free(msl);
     fn = [lib newFunctionWithName:@(r300_stage_entry(stage))];
     [lib release];
     if (fn) {
@@ -9223,6 +9401,39 @@ static id<MTLTexture> r300_texture(PPCMacGPUMetalState *st, id<MTLDevice> dev,
 static uint32_t g_r300_enc_ncb = 1;
 static R200TexKey g_r300_enc_cb[R300_US_MAX_TARGETS];
 
+/*
+ * What the open R300 pass already has bound.  A frame is hundreds of draws
+ * in one pass that mostly differ in an index list; re-setting the pipeline,
+ * sixteen textures and samplers, and a few KB of constants for each of them
+ * is encoder work that does nothing.  The cache lives exactly as long as
+ * the encoder it describes (r300_draw_encode clears it whenever it opens
+ * one, and no other path draws into an R300 pass).  The ids are not
+ * retained: the encoder keeps everything it was given alive until its
+ * command buffer completes, so a pointer here cannot be recycled meanwhile.
+ */
+static struct {
+    id<MTLRenderPipelineState> pipe;
+    int winding, cull;                  /* -1: not set yet */
+    bool zpass;                         /* fragment buffer 1 */
+    id<MTLTexture> tex[R300_NUM_TEX_UNITS];
+    id<MTLSamplerState> smp[R300_NUM_TEX_UNITS];
+    bool fsu_valid, ms_valid, vsu_valid, rect_valid;
+    R300FSUniforms fsu;
+    float ms[4];
+    R300VSUniforms *vsu;                /* last bytes bound as vertex buffer 2 */
+    MTLScissorRect rect;
+} g_r300_ec;
+static uint64_t g_r300_ec_set, g_r300_ec_skipped;   /* encoder calls made / saved */
+
+static void r300_ec_reset(void)
+{
+    R300VSUniforms *keep = g_r300_ec.vsu;
+
+    memset(&g_r300_ec, 0, sizeof(g_r300_ec));
+    g_r300_ec.vsu = keep;
+    g_r300_ec.winding = g_r300_ec.cull = -1;
+}
+
 /* A 1x1 stand-in for an unbound unit, of the type the shader declares. */
 static id<MTLTexture> r300_dummy(id<MTLDevice> dev, bool raw, uint32_t dim)
 {
@@ -9444,6 +9655,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             g_r300_enc_ncb = ncb;
             memcpy(g_r300_enc_cb, ck, sizeof(ck[0]) * ncb);
             g_r300_enc_mine = true;
+            r300_ec_reset();
             g_r200_stat_passes++;
             for (uint32_t k = 0; k < ncb; k++) {
                 r200_note_written(ck[k].offset,
@@ -9469,11 +9681,24 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             return -1;
         }
         id<MTLRenderCommandEncoder> enc = g_r200_enc;
-        [enc setRenderPipelineState:pipe];
+        if (pipe != g_r300_ec.pipe) {
+            [enc setRenderPipelineState:pipe];
+            g_r300_ec.pipe = pipe;
+            g_r300_ec_set++;
+        } else {
+            g_r300_ec_skipped++;
+        }
         /* SU_CULL_MODE; the winding also decides [[front_facing]] for
          * two-sided stencil. */
-        [enc setFrontFacingWinding:r300_front_ccw(pkt->cull) ?
-                                   MTLWindingCounterClockwise : MTLWindingClockwise];
+        int winding = r300_front_ccw(pkt->cull) ? MTLWindingCounterClockwise
+                                                : MTLWindingClockwise;
+        if (winding != g_r300_ec.winding) {
+            [enc setFrontFacingWinding:(MTLWinding)winding];
+            g_r300_ec.winding = winding;
+            g_r300_ec_set++;
+        } else {
+            g_r300_ec_skipped++;
+        }
         MTLCullMode cull = (pkt->cull & R300_CULL_FRONT) ? MTLCullModeFront :
                            (pkt->cull & R300_CULL_BACK) ? MTLCullModeBack
                                                         : MTLCullModeNone;
@@ -9483,9 +9708,25 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
         if (pkt->vs_glsl) {
             /* Vertex program on the GPU: input vertices, their uniforms
              * (R300_BIND_VSU = buffer 2) and the triangle list's indices. */
-            if (!r300_bind_bytes(st, dev, enc, pkt->vs_in, pkt->vs_in_vecs * 16u, 0) ||
-                !r300_bind_bytes(st, dev, enc, pkt->vs_u, sizeof(*pkt->vs_u), 2)) {
+            if (!r300_bind_bytes(st, dev, enc, pkt->vs_in, pkt->vs_in_vecs * 16u, 0)) {
                 return -1;
+            }
+            /* The 4.6 KB of vertex-program constants rarely change between
+             * draws; keep the arena copy that is already bound. */
+            if (!g_r300_ec.vsu) {
+                g_r300_ec.vsu = g_malloc(sizeof(*g_r300_ec.vsu));
+            }
+            if (g_r300_ec.vsu_valid &&
+                !memcmp(g_r300_ec.vsu, pkt->vs_u, sizeof(*pkt->vs_u))) {
+                g_r300_ec_skipped++;
+            } else {
+                g_r300_ec.vsu_valid = false;
+                if (!r300_bind_bytes(st, dev, enc, pkt->vs_u, sizeof(*pkt->vs_u), 2)) {
+                    return -1;
+                }
+                memcpy(g_r300_ec.vsu, pkt->vs_u, sizeof(*pkt->vs_u));
+                g_r300_ec.vsu_valid = true;
+                g_r300_ec_set++;
             }
             size_t ibytes = (size_t)pkt->num_verts * 4;
             void *idst = r200_arena_alloc(st, ibytes, &ib, &ioff);
@@ -9503,10 +9744,25 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                 return -1;
             }
         }
-        [enc setFragmentBuffer:r300_zpass_buf(dev) offset:0 atIndex:1];
+        if (!g_r300_ec.zpass) {
+            [enc setFragmentBuffer:r300_zpass_buf(dev) offset:0 atIndex:1];
+            g_r300_ec.zpass = true;
+        }
         for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
-            [enc setFragmentTexture:tex[t] atIndex:t];
-            [enc setFragmentSamplerState:smp[t] atIndex:t];
+            if (tex[t] != g_r300_ec.tex[t]) {
+                [enc setFragmentTexture:tex[t] atIndex:t];
+                g_r300_ec.tex[t] = tex[t];
+                g_r300_ec_set++;
+            } else {
+                g_r300_ec_skipped++;
+            }
+            if (smp[t] != g_r300_ec.smp[t]) {
+                [enc setFragmentSamplerState:smp[t] atIndex:t];
+                g_r300_ec.smp[t] = smp[t];
+                g_r300_ec_set++;
+            } else {
+                g_r300_ec_skipped++;
+            }
         }
         for (uint32_t k = 0; k < ns; k++) {
             /* Sample k: its columns, and the geometry moved so that the
@@ -9524,10 +9780,38 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                 [enc setViewport:(MTLViewport){ cx, 0, pkt->rt_width,
                                                 pkt->rt_height, 0, 1 }];
             }
-            [enc setScissorRect:(MTLScissorRect){ cx + sx0, sy0, sx1 - sx0, sy1 - sy0 }];
-            [enc setVertexBytes:ms length:sizeof(ms) atIndex:1];
-            [enc setFragmentBytes:&uk length:sizeof(uk) atIndex:0];
-            [enc setCullMode:cull];
+            MTLScissorRect rect = { cx + sx0, sy0, sx1 - sx0, sy1 - sy0 };
+            if (!g_r300_ec.rect_valid || memcmp(&rect, &g_r300_ec.rect, sizeof(rect))) {
+                [enc setScissorRect:rect];
+                g_r300_ec.rect = rect;
+                g_r300_ec.rect_valid = true;
+                g_r300_ec_set++;
+            } else {
+                g_r300_ec_skipped++;
+            }
+            if (!g_r300_ec.ms_valid || memcmp(ms, g_r300_ec.ms, sizeof(ms))) {
+                [enc setVertexBytes:ms length:sizeof(ms) atIndex:1];
+                memcpy(g_r300_ec.ms, ms, sizeof(ms));
+                g_r300_ec.ms_valid = true;
+                g_r300_ec_set++;
+            } else {
+                g_r300_ec_skipped++;
+            }
+            if (!g_r300_ec.fsu_valid || memcmp(&uk, &g_r300_ec.fsu, sizeof(uk))) {
+                [enc setFragmentBytes:&uk length:sizeof(uk) atIndex:0];
+                memcpy(&g_r300_ec.fsu, &uk, sizeof(uk));
+                g_r300_ec.fsu_valid = true;
+                g_r300_ec_set++;
+            } else {
+                g_r300_ec_skipped++;
+            }
+            if ((int)cull != g_r300_ec.cull) {
+                [enc setCullMode:cull];
+                g_r300_ec.cull = (int)cull;
+                g_r300_ec_set++;
+            } else {
+                g_r300_ec_skipped++;
+            }
             if (pkt->num_verts && ib) {
                 [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                                 indexCount:pkt->num_verts
@@ -9542,12 +9826,21 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             if (pkt->num_line_verts) {
                 /* polygon-mode edges: lines, never culled */
                 [enc setCullMode:MTLCullModeNone];
+                g_r300_ec.cull = (int)MTLCullModeNone;
                 [enc drawPrimitives:MTLPrimitiveTypeLine vertexStart:pkt->num_verts
                         vertexCount:pkt->num_line_verts];
             }
         }
         [ib release];
         g_r200_stat_draws++;
+        if (g_r200_stat_draws % 2000 == 0) {
+            qemu_log("ppc-mac-gpu r300: %llu draws, %llu passes, encoder calls "
+                     "%llu made / %llu skipped as already bound\n",
+                     (unsigned long long)g_r200_stat_draws,
+                     (unsigned long long)g_r200_stat_passes,
+                     (unsigned long long)g_r300_ec_set,
+                     (unsigned long long)g_r300_ec_skipped);
+        }
         for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
             if (u.tex_info[t][0] && !pkt->tex[t].host_data) {
                 r200_note_read(pkt->tex[t].gpu_addr,

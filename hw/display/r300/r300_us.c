@@ -1080,8 +1080,9 @@ static const char us_prelude_z[] =
 "   ZB_ZSTENCILCNTL: Z func 2:0; front stencil func/sfail/zpass/zfail at\n"
 "   3, 6, 9, 12; back at 15, 18, 21, 24.  STENCILREFMASK: ref, mask,\n"
 "   write mask.  Returns the new buffer word; pass says whether the\n"
-"   colour buffers take the fragment. */\n"
-"uint r300_ztest(uint zb, float fz, bool front, out bool pass)\n"
+"   colour buffers take the fragment.  cnt says whether a pass counts as a\n"
+"   Z-pass sample: the early test before shading only asks. */\n"
+"uint r300_ztest(uint zb, float fz, bool front, bool cnt, out bool pass)\n"
 "{\n"
 "    uint cntl = u.zinfo.x, zs = u.zinfo.y, rm = u.zinfo.z, fmt = u.zinfo.w;\n"
 "    bool z16 = (fmt & 4u) != 0u;\n"
@@ -1100,7 +1101,7 @@ static const char us_prelude_z[] =
 "    } else if (!zen || r300_zcmp(zs, znew, zold)) {\n"
 "        if (zen && (cntl & 4u) != 0u) z = znew;\n"
 "        if (sten) sn = r300_sop(sf >> 6, sold, ref);\n"
-"        if (u.zpass_count != 0u) atomicAdd(zpass, 1u);\n"
+"        if (cnt && u.zpass_count != 0u) atomicAdd(zpass, 1u);\n"
 "        pass = true;\n"
 "    } else {\n"
 "        if (sten) sn = r300_sop(sf >> 9, sold, ref);\n"
@@ -1125,6 +1126,24 @@ static const char us_prelude_z[] =
 "    }\n"
 "}\n"
 "\n";
+
+/*
+ * Early Z/stencil rejection.  r300_shade() runs the whole fragment program
+ * -- every texture fetch -- before the test that decides whether the
+ * fragment lands, and the buffers are plain colour attachments, so the GPU
+ * cannot reject it for us.  When the depth does not come from the program,
+ * the test can be made first: a fragment that fails it without changing the
+ * buffer's word (a stencil op that rewrites the stencil still has to run,
+ * so those take the full path) leaves everything as it was whether or not
+ * the program would have discarded it, which is exactly what discard does.
+ * Only worth the extra test for programs that fetch textures or are long.
+ */
+static const char us_early_z[] =
+"    if (!(u.depth_src != 0u && R300_WRITES_W)) {\n"
+"        bool p0;\n"
+"        uint nz = r300_ztest(zb, gl_FragCoord.z + zoff, front, false, p0);\n"
+"        if (!p0 && nz == zb) discard;\n"
+"    }\n";
 
 /*
  * Colour buffer k's pixel type (r300_cbK_t) and its conversions to and
@@ -1351,10 +1370,13 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
     uint32_t mw = ((r300_reg(st, RB3D_CCTL) >> 5) & 3) + 1;
     uint32_t ucp = r300_reg(st, VAP_CLIP_CNTL) & 0x3F;
 
+    unsigned work = 0;
+
     *err = NULL;
     r300_sb_init(&body);
     for (unsigned i = 0; i < n; i++) {
         const USNode *nd = &nodes[i];
+        work += nd->alu_count + 4 * nd->tex_count;
 
         if (nd->alu_start + nd->alu_count > R300_US_MAX_ALU ||
             nd->tex_start + nd->tex_count > R300_US_MAX_TEX) {
@@ -1376,6 +1398,8 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
             us_emit_alu(&body, st, nd->alu_start + k);
         }
     }
+
+    bool early = units != 0 || work >= 8;
 
     r300_sb_init(&sb);
     r300_sb_printf(&sb, "%s// flags %x\n", us_prelude_common, flags);
@@ -1510,19 +1534,21 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
         "    bool front = gl_FrontFacing;\n"
         "    /* SU_POLY_OFFSET_*: slope in depth per pixel */\n"
         "    float slope = max(abs(dFdx(gl_FragCoord.z)), abs(dFdy(gl_FragCoord.z)));\n"
+        "    float zoff = 0.0;\n"
+        "    if (front ? (u.poly_en & 1u) != 0u : (u.poly_en & 2u) != 0u)\n"
+        "        zoff = front ? u.poly_offset.x * slope + u.poly_offset.y\n"
+        "                     : u.poly_offset.z * slope + u.poly_offset.w;\n"
+        "%s"
         "    R300FOut c = r300_shade(%s, ow);\n"
         "    /* FG_DEPTH_SRC: the program's OMASK_W output replaces the depth */\n"
-        "    float fz = (u.depth_src != 0u && R300_WRITES_W) ? ow : gl_FragCoord.z;\n"
-        "    if (front ? (u.poly_en & 1u) != 0u : (u.poly_en & 2u) != 0u)\n"
-        "        fz += front ? u.poly_offset.x * slope + u.poly_offset.y\n"
-        "                    : u.poly_offset.z * slope + u.poly_offset.w;\n"
+        "    float fz = ((u.depth_src != 0u && R300_WRITES_W) ? ow : gl_FragCoord.z) + zoff;\n"
         "    bool pass;\n"
-        "    o_z = uvec4(r300_ztest(zb, fz, front, pass), 0u, 0u, 0u);\n"
+        "    o_z = uvec4(r300_ztest(zb, fz, front, true, pass), 0u, 0u, 0u);\n"
         "%s"
         "#endif\n"
         "}\n"
         "#endif\n",
-        fbarg.buf + 2, zsel.buf);
+        early ? us_early_z : "", fbarg.buf + 2, zsel.buf);
     r300_sb_free(&outs);
     r300_sb_free(&fbp);
     r300_sb_free(&fbarg);

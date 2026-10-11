@@ -163,3 +163,18 @@ char *r300_glsl_to_msl(const char *glsl, R300Stage stage, char **err)
     free(spv);
     return msl;
 }
+
+const char *r300_msl_toolchain_id(void)
+{
+    static char id[256];
+
+    if (!id[0]) {
+        unsigned sv = 0, sr = 0;
+
+        shaderc_get_spv_version(&sv, &sr);
+        snprintf(id, sizeof(id), "r300-msl-1 spvc %s shaderc-spv %x.%u built %s %s",
+                 spvc_get_commit_revision_and_timestamp(), sv, sr,
+                 __DATE__, __TIME__);
+    }
+    return id;
+}
