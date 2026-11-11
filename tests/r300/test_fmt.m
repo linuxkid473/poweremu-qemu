@@ -208,6 +208,12 @@ static Target render_tex(uint32_t fmt, uint32_t swap, bool yuv, const void *texe
             withBytes:texels bytesPerRow:pitch_bytes];
     R300FSUniforms u = base_uniforms();
     u.tex_info[0][0] = 1;
+    if (yuv) {
+        /* QuickTime leaves RGB selectors at X and alpha at ONE. YUV
+         * formats ignore these selectors and return converted components. */
+        u.tex_swz[0][0] = u.tex_swz[0][1] = u.tex_swz[0][2] = 0;
+        u.tex_swz[0][3] = 5;
+    }
     u.tex_info[0][1] = pitch_bytes / vb;    /* view elements per row */
     u.tex_info[0][2] = W;
     u.tex_info[0][3] = H;
@@ -429,9 +435,17 @@ int main(void)
             CHECK(NEAR(o[0], o[1]) && NEAR(o[1], o[2]) && fabsf(o[0] - 0.5f) < 0.02f,
                   "YUV grey %g %g %g", o[0], o[1], o[2]);
             out4(&t, 13, 1, o);
-            /* X = B, Y = G, Z = R */
             CHECK(o[2] > 0.95f && o[1] < 0.05f && o[0] < 0.05f, "YUV red %g %g %g",
                   o[0], o[1], o[2]);
+            for (int i = 0; i < W * H / 2; i++) {
+                uint8_t *b = tx + 4 * i;
+                uint8_t cb = b[0], y = b[1];
+                b[0] = b[2]; b[1] = b[3]; b[2] = cb; b[3] = y;
+            }
+            t = render_tex(0x14, 0, true, tx, W * 2, nearest);
+            out4(&t, 13, 1, o);
+            CHECK(o[2] > 0.95f && o[1] < 0.05f && o[0] < 0.05f && NEAR(o[3], 1.0f),
+                  "VYUY red with ignored selectors %g %g %g %g", o[0], o[1], o[2], o[3]);
         }
         /* W16Z16Y16X16 */
         {

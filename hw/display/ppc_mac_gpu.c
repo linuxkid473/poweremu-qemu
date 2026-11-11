@@ -1579,11 +1579,12 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
 #include <emmintrin.h>
 #endif
 
-static void ppc_mac_gpu_bswap_line32(uint32_t *restrict dst,
+static bool ppc_mac_gpu_bswap_line32(uint32_t *restrict dst,
                                      const uint32_t *restrict src,
-                                     int width)
+                                     int width, bool compare)
 {
     int i = 0;
+    bool changed = !compare;
 
 #if defined(__ARM_NEON)
     /* reverse the bytes of each 32-bit pixel; 16 bytes = 4 pixels a round,
@@ -1593,24 +1594,37 @@ static void ppc_mac_gpu_bswap_line32(uint32_t *restrict dst,
         uint8x16_t b = vrev32q_u8(vld1q_u8((const uint8_t *)(src + i + 4)));
         uint8x16_t c = vrev32q_u8(vld1q_u8((const uint8_t *)(src + i + 8)));
         uint8x16_t d = vrev32q_u8(vld1q_u8((const uint8_t *)(src + i + 12)));
+        if (!changed) {
+            uint8x16_t diff = veorq_u8(a, vld1q_u8((const uint8_t *)(dst + i)));
+            diff = vorrq_u8(diff, veorq_u8(b, vld1q_u8((const uint8_t *)(dst + i + 4))));
+            diff = vorrq_u8(diff, veorq_u8(c, vld1q_u8((const uint8_t *)(dst + i + 8))));
+            diff = vorrq_u8(diff, veorq_u8(d, vld1q_u8((const uint8_t *)(dst + i + 12))));
+            uint64x2_t bits = vreinterpretq_u64_u8(diff);
+            changed = vgetq_lane_u64(bits, 0) || vgetq_lane_u64(bits, 1);
+        }
         vst1q_u8((uint8_t *)(dst + i), a);
         vst1q_u8((uint8_t *)(dst + i + 4), b);
         vst1q_u8((uint8_t *)(dst + i + 8), c);
         vst1q_u8((uint8_t *)(dst + i + 12), d);
     }
 #elif defined(__SSE2__)
-    const __m128i m = _mm_set1_epi32(0x00FF00FF);
     for (; i + 4 <= width; i += 4) {
         __m128i v = _mm_loadu_si128((const __m128i *)(src + i));
         v = _mm_or_si128(_mm_srli_epi32(v, 16), _mm_slli_epi32(v, 16));
-        v = _mm_or_si128(_mm_slli_epi16(_mm_and_si128(v, m), 8),
-                         _mm_srli_epi16(_mm_and_si128(v, m), 8));
+        v = _mm_or_si128(_mm_slli_epi16(v, 8), _mm_srli_epi16(v, 8));
+        if (!changed) {
+            __m128i prev = _mm_loadu_si128((const __m128i *)(dst + i));
+            changed = _mm_movemask_epi8(_mm_cmpeq_epi8(v, prev)) != 0xffff;
+        }
         _mm_storeu_si128((__m128i *)(dst + i), v);
     }
 #endif
     for (; i < width; i++) {
-        dst[i] = bswap32(src[i]);
+        uint32_t pixel = bswap32(src[i]);
+        changed = changed || dst[i] != pixel;
+        dst[i] = pixel;
     }
+    return changed;
 }
 
 /*
@@ -2163,24 +2177,32 @@ static void ppc_mac_gpu_display_update(void *opaque)
     const uint32_t *src = (const uint32_t *)(vram_ptr + s->disp.offset);
     uint32_t *dst = (uint32_t *)s->shadow_buf;
     uint32_t stride_u32 = stride / 4;
-    int y;
-    r200_rate.co_copies++;
-    if (y0 != 0 || y1 != (int)height) {
-        r200_rate.co_partials++;
-    }
-    for (y = y0; y < y1; y++) {
-        ppc_mac_gpu_bswap_line32(dst + y * stride_u32,
-                                  src + y * stride_u32,
-                                  width);
+    /* Vulkan owns the dirty log, so compare its completed scanout with the
+     * shadow buffer and only notify the UI about rows that changed. */
+    bool compare = !s->scanout_log_owner && ppc_gpu_dirty_scanout &&
+                   s->scanout_dirty_valid && !mode_changed &&
+                   s->scanout_offset == s->disp.offset;
+    int first = y1, last = y0;
+    for (int y = y0; y < y1; y++) {
+        if (ppc_mac_gpu_bswap_line32(dst + y * stride_u32,
+                                    src + y * stride_u32, width, compare)) {
+            first = MIN(first, y);
+            last = y + 1;
+        }
     }
     s->scanout_offset = s->disp.offset;
-    s->scanout_dirty_valid = s->scanout_log_owner;
+    s->scanout_dirty_valid = true;
     s->scanout_defers = 0;
 
-    if (y0 == 0 && y1 == (int)height) {
+    if (first >= last) {
+        r200_rate.co_skips++;
+    } else if (first == 0 && last == (int)height) {
+        r200_rate.co_copies++;
         dpy_gfx_update_full(s->con);
     } else {
-        dpy_gfx_update(s->con, 0, y0, width, y1 - y0);
+        r200_rate.co_copies++;
+        r200_rate.co_partials++;
+        dpy_gfx_update(s->con, 0, first, width, last - first);
     }
 }
 
@@ -3502,9 +3524,9 @@ static bool ppc_mac_gpu_r300_packet3(PPCMacGPUState *s, uint32_t opcode,
         fprintf(s->r3_dump, "\n");
         fflush(s->r3_dump);
     }
-    if (s->r3->draws && s->r3_trace_lines < 40000) {
+    if (s->r3_dump && s->r3->draws && s->r3_trace_lines < 40000) {
         s->r3_trace_lines++;
-        fprintf(s->r3_dump ? s->r3_dump : stderr, "T3 %02x n=%u %08x %08x\n", opcode,
+        fprintf(s->r3_dump, "T3 %02x n=%u %08x %08x\n", opcode,
                 body_dw, body_dw ? d[0] : 0, body_dw > 1 ? d[1] : 0);
     }
     if (!draw && r300_drawlog()) {
@@ -12455,7 +12477,14 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
                           "ppc-mac-gpu-mmio", PPC_MAC_GPU_MMIO_SIZE);
     pci_register_bar(dev, PPC_MAC_GPU_MMIO_BAR,
                      PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
-    ppc_mac_gpu_cp_start(s);
+    /*
+     * Vulkan harvests VRAM dirtiness while processing draws. On TCG the
+     * snapshot waits for the vCPU and drops the BQL if called from another
+     * thread. Keep the ring on the vCPU so it cannot be re-entered there.
+     */
+    if (!want_vulkan) {
+        ppc_mac_gpu_cp_start(s);
+    }
 
     /* BAR1: I/O space alias to first 256 bytes of MMIO */
     memory_region_init_alias(&s->io, obj, "ppc-mac-gpu-io",
@@ -12726,9 +12755,8 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
                 s->renderer = NULL;
             }
         }
-        if (!s->renderer)
 #endif
-        {
+        if (!s->renderer) {
             s->renderer = ppc_mac_gpu_renderer_sw();
             s->renderer_opaque = s->renderer->init(vram_ptr, s->vram_size);
             qemu_log("ppc-mac-gpu: using software renderer (3D textured quad)\n");
