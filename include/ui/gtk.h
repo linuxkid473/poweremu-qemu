@@ -41,6 +41,10 @@ typedef struct VirtualGfxConsole {
     DisplaySurface *ds;
     pixman_image_t *convert;
     cairo_surface_t *surface;
+    GdkCursor *guest_cursor;
+    cairo_surface_t *guest_cursor_surface;
+    int guest_cursor_x, guest_cursor_y;
+    bool guest_cursor_hidden;
     double scale_x;
     double scale_y;
 #if defined(CONFIG_OPENGL)
@@ -138,6 +142,7 @@ struct GtkDisplayState {
     gboolean full_screen;
 
     GdkCursor *null_cursor;
+    GdkCursor *blank_cursor;
     Notifier mouse_mode_notifier;
     gboolean free_scale;
 

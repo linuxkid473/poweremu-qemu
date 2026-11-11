@@ -190,6 +190,12 @@ static bool gd_grab_on_hover(GtkDisplayState *s)
     return gtk_check_menu_item_get_active(GTK_CHECK_MENU_ITEM(s->grab_on_hover_item));
 }
 
+static bool gd_draw_guest_cursor(VirtualConsole *vc)
+{
+    return vc->gfx.guest_cursor_surface &&
+           qemu_input_is_absolute(vc->gfx.dcl.con);
+}
+
 static void gd_update_cursor(VirtualConsole *vc)
 {
     GtkDisplayState *s = vc->s;
@@ -205,7 +211,11 @@ static void gd_update_cursor(VirtualConsole *vc)
     }
 
     window = gtk_widget_get_window(GTK_WIDGET(vc->gfx.drawing_area));
-    if (s->full_screen || qemu_input_is_absolute(vc->gfx.dcl.con) || s->ptr_owner == vc) {
+    if (gd_draw_guest_cursor(vc)) {
+        gdk_window_set_cursor(window, s->blank_cursor);
+    } else if (vc->gfx.guest_cursor && !vc->gfx.guest_cursor_hidden) {
+        gdk_window_set_cursor(window, vc->gfx.guest_cursor);
+    } else if (s->full_screen || qemu_input_is_absolute(vc->gfx.dcl.con) || s->ptr_owner == vc) {
         gdk_window_set_cursor(window, s->null_cursor);
     } else {
         gdk_window_set_cursor(window, NULL);
@@ -446,6 +456,24 @@ static GdkDevice *gd_get_pointer(GdkDisplay *dpy)
     return gdk_seat_get_pointer(gdk_display_get_default_seat(dpy));
 }
 
+static void gd_damage_guest_cursor(VirtualConsole *vc)
+{
+    cairo_surface_t *surface = vc->gfx.guest_cursor_surface;
+
+    if (!vc->gfx.ds || !gd_draw_guest_cursor(vc) || vc->gfx.guest_cursor_hidden) {
+        return;
+    }
+    int x = MAX(0, vc->gfx.guest_cursor_x);
+    int y = MAX(0, vc->gfx.guest_cursor_y);
+    int right = MIN(surface_width(vc->gfx.ds),
+                    vc->gfx.guest_cursor_x + cairo_image_surface_get_width(surface));
+    int bottom = MIN(surface_height(vc->gfx.ds),
+                     vc->gfx.guest_cursor_y + cairo_image_surface_get_height(surface));
+    if (x < right && y < bottom) {
+        gd_update(&vc->gfx.dcl, x, y, right - x, bottom - y);
+    }
+}
+
 static void gd_mouse_set(DisplayChangeListener *dcl,
                          int x, int y, bool visible)
 {
@@ -453,6 +481,17 @@ static void gd_mouse_set(DisplayChangeListener *dcl,
     GdkDisplay *dpy;
     gint x_root, y_root;
 
+    bool changed = vc->gfx.guest_cursor_hidden == visible;
+    if (changed || x != vc->gfx.guest_cursor_x || y != vc->gfx.guest_cursor_y) {
+        gd_damage_guest_cursor(vc);
+        vc->gfx.guest_cursor_x = x;
+        vc->gfx.guest_cursor_y = y;
+        vc->gfx.guest_cursor_hidden = !visible;
+        gd_damage_guest_cursor(vc);
+        if (changed) {
+            gd_update_cursor(vc);
+        }
+    }
     if (!gtk_widget_get_realized(vc->gfx.drawing_area) ||
         qemu_input_is_absolute(dcl->con)) {
         return;
@@ -475,20 +514,30 @@ static void gd_cursor_define(DisplayChangeListener *dcl,
     GdkPixbuf *pixbuf;
     GdkCursor *cursor;
 
-    if (!gtk_widget_get_realized(vc->gfx.drawing_area)) {
-        return;
+    pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, true, 8, c->width, c->height);
+    for (int y = 0; y < c->height; y++) {
+        guchar *row = gdk_pixbuf_get_pixels(pixbuf) + y * gdk_pixbuf_get_rowstride(pixbuf);
+        for (int x = 0; x < c->width; x++) {
+            uint32_t pixel = c->data[y * c->width + x];
+            *row++ = pixel >> 16;
+            *row++ = pixel >> 8;
+            *row++ = pixel;
+            *row++ = pixel >> 24;
+        }
     }
-
-    pixbuf = gdk_pixbuf_new_from_data((guchar *)(c->data),
-                                      GDK_COLORSPACE_RGB, true, 8,
-                                      c->width, c->height, c->width * 4,
-                                      NULL, NULL);
     cursor = gdk_cursor_new_from_pixbuf
         (gtk_widget_get_display(vc->gfx.drawing_area),
          pixbuf, c->hot_x, c->hot_y);
-    gdk_window_set_cursor(gtk_widget_get_window(vc->gfx.drawing_area), cursor);
+    g_clear_object(&vc->gfx.guest_cursor);
+    vc->gfx.guest_cursor = cursor;
+    if (!display_opengl) {
+        gd_damage_guest_cursor(vc);
+        g_clear_pointer(&vc->gfx.guest_cursor_surface, cairo_surface_destroy);
+        vc->gfx.guest_cursor_surface = gdk_cairo_surface_create_from_pixbuf(pixbuf, 1, NULL);
+        gd_damage_guest_cursor(vc);
+    }
+    gd_update_cursor(vc);
     g_object_unref(pixbuf);
-    g_object_unref(cursor);
 }
 
 static void gd_switch(DisplayChangeListener *dcl,
@@ -797,6 +846,11 @@ void gd_update_monitor_refresh_rate(VirtualConsole *vc, GtkWidget *widget)
     vc->gfx.dcl.update_interval = refresh_rate ?
         MIN(1000 * 1000 / refresh_rate, GUI_REFRESH_INTERVAL_DEFAULT) :
         GUI_REFRESH_INTERVAL_DEFAULT;
+    /* Avoid polling and copying a software framebuffer at high-refresh
+     * monitor rates. Devices can still request an immediate page flip. */
+    if (!display_opengl) {
+        vc->gfx.dcl.update_interval = MAX(vc->gfx.dcl.update_interval, 16);
+    }
 #endif
 }
 
@@ -879,9 +933,54 @@ static gboolean gd_draw_event(GtkWidget *widget, cairo_t *cr, void *opaque)
     cairo_scale(cr, vc->gfx.scale_x, vc->gfx.scale_y);
     cairo_set_source_surface(cr, vc->gfx.surface,
                              mx / vc->gfx.scale_x, my / vc->gfx.scale_y);
+    if (vc->gfx.scale_x > 1.0 || vc->gfx.scale_y > 1.0) {
+        /* Bilinear filtering a fullscreen CPU surface can take longer
+         * than a video frame, particularly on a 4K monitor. */
+        cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_NEAREST);
+    }
     cairo_paint(cr);
 
+    if (gd_draw_guest_cursor(vc) && !vc->gfx.guest_cursor_hidden) {
+        cairo_rectangle(cr, mx / vc->gfx.scale_x, my / vc->gfx.scale_y,
+                        surface_width(vc->gfx.ds), surface_height(vc->gfx.ds));
+        cairo_clip(cr);
+        cairo_set_source_surface(cr, vc->gfx.guest_cursor_surface,
+                                 mx / vc->gfx.scale_x + vc->gfx.guest_cursor_x,
+                                 my / vc->gfx.scale_y + vc->gfx.guest_cursor_y);
+        cairo_paint(cr);
+    }
     return TRUE;
+}
+
+/* Undo the same scaling and centering used to draw the guest framebuffer. */
+static void gd_pointer_position(VirtualConsole *vc, GtkWidget *widget,
+                                double px, double py, int *x, int *y)
+{
+    GdkWindow *window = gtk_widget_get_window(widget);
+    int ww = gdk_window_get_width(window);
+    int wh = gdk_window_get_height(window);
+    int fbw = surface_width(vc->gfx.ds) * vc->gfx.scale_x;
+    int fbh = surface_height(vc->gfx.ds) * vc->gfx.scale_y;
+    int mx = MAX(0, ww - fbw) / 2;
+    int my = MAX(0, wh - fbh) / 2;
+
+    *x = floor((px - mx) / vc->gfx.scale_x);
+    *y = floor((py - my) / vc->gfx.scale_y);
+    trace_gd_motion_event(ww, wh, gtk_widget_get_scale_factor(widget), *x, *y);
+}
+
+static bool gd_queue_absolute_pointer(VirtualConsole *vc, int x, int y)
+{
+    int width = surface_width(vc->gfx.ds);
+    int height = surface_height(vc->gfx.ds);
+
+    if (x < 0 || y < 0 || x >= width || y >= height) {
+        return false;
+    }
+    /* Target the center of the pixel in the tablet's coordinate range. */
+    qemu_input_queue_abs(vc->gfx.dcl.con, INPUT_AXIS_X, 2 * x + 1, 0, 2 * width);
+    qemu_input_queue_abs(vc->gfx.dcl.con, INPUT_AXIS_Y, 2 * y + 1, 0, 2 * height);
+    return true;
 }
 
 static gboolean gd_motion_event(GtkWidget *widget, GdkEventMotion *motion,
@@ -890,52 +989,16 @@ static gboolean gd_motion_event(GtkWidget *widget, GdkEventMotion *motion,
     VirtualConsole *vc = opaque;
     GtkDisplayState *s = vc->s;
     int x, y;
-    int mx, my;
-    int fbh, fbw;
-    int ww, wh;
 
     if (!vc->gfx.ds) {
         return TRUE;
     }
-
-    fbw = surface_width(vc->gfx.ds) * vc->gfx.scale_x;
-    fbh = surface_height(vc->gfx.ds) * vc->gfx.scale_y;
-    ww = gtk_widget_get_allocated_width(widget);
-    wh = gtk_widget_get_allocated_height(widget);
-
-    /*
-     * `widget` may not have the same size with the frame buffer.
-     * In such cases, some paddings are needed around the `vc`.
-     * To achieve that, `vc` will be displayed at (mx, my)
-     * so that it is displayed at the center of the widget.
-     */
-    mx = my = 0;
-    if (ww > fbw) {
-        mx = (ww - fbw) / 2;
-    }
-    if (wh > fbh) {
-        my = (wh - fbh) / 2;
-    }
-
-    /*
-     * `motion` is reported in `widget` coordinates
-     * so translating it to the coordinates in `vc`.
-     */
-    x = (motion->x - mx) / vc->gfx.scale_x;
-    y = (motion->y - my) / vc->gfx.scale_y;
-
-    trace_gd_motion_event(ww, wh, gtk_widget_get_scale_factor(widget), x, y);
+    gd_pointer_position(vc, widget, motion->x, motion->y, &x, &y);
 
     if (qemu_input_is_absolute(vc->gfx.dcl.con)) {
-        if (x < 0 || y < 0 ||
-            x >= surface_width(vc->gfx.ds) ||
-            y >= surface_height(vc->gfx.ds)) {
+        if (!gd_queue_absolute_pointer(vc, x, y)) {
             return TRUE;
         }
-        qemu_input_queue_abs(vc->gfx.dcl.con, INPUT_AXIS_X, x,
-                             0, surface_width(vc->gfx.ds));
-        qemu_input_queue_abs(vc->gfx.dcl.con, INPUT_AXIS_Y, y,
-                             0, surface_height(vc->gfx.ds));
         qemu_input_event_sync();
     } else if (s->last_set && s->ptr_owner == vc) {
         qemu_input_queue_rel(vc->gfx.dcl.con, INPUT_AXIS_X, x - s->last_x);
@@ -1016,6 +1079,15 @@ static gboolean gd_button_event(GtkWidget *widget, GdkEventButton *button,
         return TRUE;
     }
 
+    if (vc->gfx.ds && qemu_input_is_absolute(vc->gfx.dcl.con)) {
+        int x, y;
+
+        gd_pointer_position(vc, widget, button->x, button->y, &x, &y);
+        if (!gd_queue_absolute_pointer(vc, x, y) &&
+            button->type == GDK_BUTTON_PRESS) {
+            return TRUE;
+        }
+    }
     qemu_input_queue_btn(vc->gfx.dcl.con, btn,
                          button->type == GDK_BUTTON_PRESS);
     qemu_input_event_sync();
@@ -1579,7 +1651,12 @@ static void gd_grab_update(VirtualConsole *vc, bool kbd, bool ptr)
     }
     if (ptr) {
         caps |= GDK_SEAT_CAPABILITY_ALL_POINTING;
-        cursor = vc->s->null_cursor;
+        if (gd_draw_guest_cursor(vc)) {
+            cursor = vc->s->blank_cursor;
+        } else {
+            cursor = vc->gfx.guest_cursor && !vc->gfx.guest_cursor_hidden ?
+                     vc->gfx.guest_cursor : vc->s->null_cursor;
+        }
     }
 
     if (caps) {
@@ -2421,12 +2498,9 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
     textdomain("qemu");
 
     window_display = gtk_widget_get_display(s->window);
-    if (s->opts->has_show_cursor && s->opts->show_cursor) {
-        s->null_cursor = NULL; /* default pointer */
-    } else {
-        s->null_cursor = gdk_cursor_new_for_display(window_display,
-                                                    GDK_BLANK_CURSOR);
-    }
+    s->blank_cursor = gdk_cursor_new_for_display(window_display, GDK_BLANK_CURSOR);
+    s->null_cursor = s->opts->has_show_cursor && s->opts->show_cursor ?
+                     NULL : s->blank_cursor;
 
     s->mouse_mode_notifier.notify = gd_mouse_mode_change;
     qemu_add_mouse_mode_change_notifier(&s->mouse_mode_notifier);
