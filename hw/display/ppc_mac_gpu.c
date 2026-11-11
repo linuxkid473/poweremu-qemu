@@ -3524,9 +3524,9 @@ static bool ppc_mac_gpu_r300_packet3(PPCMacGPUState *s, uint32_t opcode,
         fprintf(s->r3_dump, "\n");
         fflush(s->r3_dump);
     }
-    if (s->r3->draws && s->r3_trace_lines < 40000) {
+    if (s->r3_dump && s->r3->draws && s->r3_trace_lines < 40000) {
         s->r3_trace_lines++;
-        fprintf(s->r3_dump ? s->r3_dump : stderr, "T3 %02x n=%u %08x %08x\n", opcode,
+        fprintf(s->r3_dump, "T3 %02x n=%u %08x %08x\n", opcode,
                 body_dw, body_dw ? d[0] : 0, body_dw > 1 ? d[1] : 0);
     }
     if (!draw && r300_drawlog()) {
