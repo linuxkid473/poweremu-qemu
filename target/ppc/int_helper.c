@@ -32,6 +32,11 @@
 #include "tcg/tcg-gvec-desc.h"
 
 #include "helper_regs.h"
+
+#if defined(__x86_64__) || defined(__i386__)
+#include "host/cpuinfo.h"
+#include <immintrin.h>
+#endif
 /*****************************************************************************/
 /* Fixed point operations helpers */
 
@@ -1124,7 +1129,16 @@ void helper_VMLADDUHM(ppc_avr_t *r, ppc_avr_t *a, ppc_avr_t *b, ppc_avr_t *c,
     }
 }
 
-#define VMRG_DO(name, element, access, ofs)                                  \
+#if defined(__SSE2__)
+#define VMRG_DO(name, element, access, ofs, unpack)                           \
+    void helper_v##name(ppc_avr_t *r, ppc_avr_t *a, ppc_avr_t *b)             \
+    {                                                                       \
+        __m128i va = _mm_loadu_si128((const __m128i *)a);                      \
+        __m128i vb = _mm_loadu_si128((const __m128i *)b);                      \
+        _mm_storeu_si128((__m128i *)r, unpack(vb, va));                        \
+    }
+#else
+#define VMRG_DO(name, element, access, ofs, unpack)                           \
     void helper_v##name(ppc_avr_t *r, ppc_avr_t *a, ppc_avr_t *b)            \
     {                                                                        \
         ppc_avr_t result;                                                    \
@@ -1136,18 +1150,43 @@ void helper_VMLADDUHM(ppc_avr_t *r, ppc_avr_t *a, ppc_avr_t *b, ppc_avr_t *c,
         }                                                                    \
         *r = result;                                                         \
     }
+#endif
 
-#define VMRG(suffix, element, access)          \
-    VMRG_DO(mrgl##suffix, element, access, half)   \
-    VMRG_DO(mrgh##suffix, element, access, 0)
-VMRG(b, u8, VsrB)
-VMRG(h, u16, VsrH)
-VMRG(w, u32, VsrW)
+#define VMRG(suffix, element, access, lo, hi)                                 \
+    VMRG_DO(mrgl##suffix, element, access, half, lo)                           \
+    VMRG_DO(mrgh##suffix, element, access, 0, hi)
+VMRG(b, u8, VsrB, _mm_unpacklo_epi8, _mm_unpackhi_epi8)
+VMRG(h, u16, VsrH, _mm_unpacklo_epi16, _mm_unpackhi_epi16)
+VMRG(w, u32, VsrW, _mm_unpacklo_epi32, _mm_unpackhi_epi32)
 #undef VMRG_DO
 #undef VMRG
 
+#if defined(__x86_64__) || defined(__i386__)
+static void __attribute__((target("avx2")))
+vmsummbm_avx2(ppc_avr_t *r, const ppc_avr_t *a, const ppc_avr_t *b,
+              const ppc_avr_t *c)
+{
+    __m256i va = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)a));
+    __m256i vb = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)b));
+    __m256i products = _mm256_mullo_epi16(va, vb);
+    __m256i pairs = _mm256_madd_epi16(products, _mm256_set1_epi16(1));
+    __m256i groups = _mm256_hadd_epi32(pairs, pairs);
+    __m128i sums = _mm_unpacklo_epi64(_mm256_castsi256_si128(groups),
+                                     _mm256_extracti128_si256(groups, 1));
+
+    sums = _mm_add_epi32(sums, _mm_loadu_si128((const __m128i *)c));
+    _mm_storeu_si128((__m128i *)r, sums);
+}
+#endif
+
 void helper_VMSUMMBM(ppc_avr_t *r, ppc_avr_t *a, ppc_avr_t *b, ppc_avr_t *c)
 {
+#if defined(__x86_64__) || defined(__i386__)
+    if (cpuinfo & CPUINFO_AVX2) {
+        vmsummbm_avx2(r, a, b, c);
+        return;
+    }
+#endif
     int32_t prod[16];
     int i;
 
@@ -1163,6 +1202,14 @@ void helper_VMSUMMBM(ppc_avr_t *r, ppc_avr_t *a, ppc_avr_t *b, ppc_avr_t *c)
 
 void helper_VMSUMSHM(ppc_avr_t *r, ppc_avr_t *a, ppc_avr_t *b, ppc_avr_t *c)
 {
+#if defined(__SSE2__)
+    __m128i va = _mm_loadu_si128((const __m128i *)a);
+    __m128i vb = _mm_loadu_si128((const __m128i *)b);
+    __m128i sums = _mm_madd_epi16(va, vb);
+
+    sums = _mm_add_epi32(sums, _mm_loadu_si128((const __m128i *)c));
+    _mm_storeu_si128((__m128i *)r, sums);
+#else
     int32_t prod[8];
     int i;
 
@@ -1173,6 +1220,7 @@ void helper_VMSUMSHM(ppc_avr_t *r, ppc_avr_t *a, ppc_avr_t *b, ppc_avr_t *c)
     VECTOR_FOR_INORDER_I(i, s32) {
         r->s32[i] = c->s32[i] + prod[2 * i] + prod[2 * i + 1];
     }
+#endif
 }
 
 void helper_VMSUMSHS(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *a,
@@ -1409,8 +1457,31 @@ void helper_VMODUQ(ppc_avr_t *t, ppc_avr_t *a, ppc_avr_t *b)
     }
 }
 
+#if defined(__x86_64__) || defined(__i386__)
+static void __attribute__((target("avx2")))
+vperm_avx2(ppc_avr_t *r, const ppc_avr_t *a, const ppc_avr_t *b,
+           const ppc_avr_t *c)
+{
+    __m128i indices = _mm_and_si128(_mm_loadu_si128((const __m128i *)c),
+                                  _mm_set1_epi8(31));
+    /* PPC byte indices count from the opposite end of each host vector. */
+    __m128i control = _mm_xor_si128(indices, _mm_set1_epi8(15));
+    __m128i from_a = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)a), control);
+    __m128i from_b = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)b), control);
+    __m128i selection = _mm_slli_epi16(indices, 3);
+
+    _mm_storeu_si128((__m128i *)r, _mm_blendv_epi8(from_a, from_b, selection));
+}
+#endif
+
 void helper_VPERM(ppc_avr_t *r, ppc_avr_t *a, ppc_avr_t *b, ppc_avr_t *c)
 {
+#if defined(__x86_64__) || defined(__i386__)
+    if (cpuinfo & CPUINFO_AVX2) {
+        vperm_avx2(r, a, b, c);
+        return;
+    }
+#endif
     ppc_avr_t result;
     int i;
 
@@ -1683,8 +1754,40 @@ void helper_vpkpx(ppc_avr_t *r, ppc_avr_t *a, ppc_avr_t *b)
     }
 #define I(x, y) (x)
 VPK(shss, s16, s8, cvtshsb, 1)
+#if defined(__SSE2__)
+void helper_vpkshus(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *a, ppc_avr_t *b)
+{
+    __m128i va = _mm_loadu_si128((const __m128i *)a);
+    __m128i vb = _mm_loadu_si128((const __m128i *)b);
+    __m128i packed = _mm_packus_epi16(vb, va);
+    __m128i zero = _mm_setzero_si128();
+    __m128i same_a = _mm_cmpeq_epi16(_mm_unpackhi_epi8(packed, zero), va);
+    __m128i same_b = _mm_cmpeq_epi16(_mm_unpacklo_epi8(packed, zero), vb);
+
+    _mm_storeu_si128((__m128i *)r, packed);
+    if (_mm_movemask_epi8(_mm_and_si128(same_a, same_b)) != 0xffff) {
+        set_vscr_sat(env);
+    }
+}
+
+void helper_vpkswss(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *a, ppc_avr_t *b)
+{
+    __m128i va = _mm_loadu_si128((const __m128i *)a);
+    __m128i vb = _mm_loadu_si128((const __m128i *)b);
+    __m128i packed = _mm_packs_epi32(vb, va);
+    __m128i sign = _mm_srai_epi16(packed, 15);
+    __m128i same_a = _mm_cmpeq_epi32(_mm_unpackhi_epi16(packed, sign), va);
+    __m128i same_b = _mm_cmpeq_epi32(_mm_unpacklo_epi16(packed, sign), vb);
+
+    _mm_storeu_si128((__m128i *)r, packed);
+    if (_mm_movemask_epi8(_mm_and_si128(same_a, same_b)) != 0xffff) {
+        set_vscr_sat(env);
+    }
+}
+#else
 VPK(shus, s16, u8, cvtshub, 1)
 VPK(swss, s32, s16, cvtswsh, 1)
+#endif
 VPK(swus, s32, u16, cvtswuh, 1)
 VPK(sdss, s64, s32, cvtsdsw, 1)
 VPK(sdus, s64, u32, cvtsduw, 1)

@@ -1335,8 +1335,11 @@ static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
         return 0;
     }
     vk_end_pass();
-    /* What the device marked dirty for this batch's draws is ours. */
-    vk_harvest();
+    /*
+     * The next draw harvests CPU writes before using cached images.
+     * Harvesting here can release the BQL while waiting for the vCPU,
+     * allowing another flush to end this same command buffer.
+     */
     for (int i = 0; i < VK_MAX_IMG; i++) {
         if (V.img[i].live && V.img[i].dirty) {
             vk_copy_to_vram(&V.img[i]);
